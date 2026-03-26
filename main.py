@@ -140,13 +140,18 @@ def run():
         last_trade_day = today
 
     futures = get_live_perpetual_futures()
+    if not futures:
+        print("❌ No live perpetual futures found. Check API connectivity/base URL.")
+        return
 
-    for f in futures:
+    allowed_futures = [f for f in futures if f["symbol"] in ALLOWED_SYMBOLS]
+    if not allowed_futures:
+        print(f"⚠️ No futures from ALLOWED_SYMBOLS found. Allowed={sorted(ALLOWED_SYMBOLS)}")
+        return
+
+    for f in allowed_futures:
         symbol = f["symbol"]
         product_id = f["product_id"]
-
-        if symbol not in ALLOWED_SYMBOLS:
-            continue
 
         if trade_count >= MAX_TRADES_PER_DAY:
             print("🛑 Daily trade limit reached")
