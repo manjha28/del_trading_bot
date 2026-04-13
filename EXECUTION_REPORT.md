@@ -243,8 +243,42 @@ In Python, this repo disables proxy inheritance in `scanner.py` and `backtest.py
 
 ## Backtest strategies now supported
 
+<<<<<<< codex/analyze-repo-and-module-functionality-oy9m5e
+Current default strategy set has been simplified to only:
+- `mhr_trailing_rr4`
+
+(Static RR strategy was removed per request.)
+
+## Latest strategy/backtest updates (requested)
+
+- Removed `mhr_static_rr4`; backtest now supports only `mhr_trailing_rr4`.
+- Added liquidity + execution quality filters:
+  - minimum 24h volume (`--min-volume`, default 5,000,000)
+  - spread threshold (`--max-spread`)
+- Updated MHR trailing model:
+  - baseline RR remains 1:4
+  - partial book 50% at 1:2
+  - remaining quantity trails at 1:1
+- Added cooldown controls and concurrent trade cap in backtest:
+  - `--cooldown-min`, `--cooldown-max`
+  - `--max-open-trades`
+- Added per-side fee support (`--charges`, default 0.05%).
+- Live order flow (`main.py`) now places MHR-style brackets:
+  - full stop-loss
+  - 50% take-profit limit at 2R
+  - remainder reserved for trailing logic management.
+
+## New usability update: hard-coded defaults + soft-coded interactive inputs
+
+Backtest now supports both:
+- hard-coded defaults (regular CLI run), and
+- soft-coded user input mode via `--interactive`.
+
+In interactive mode, pressing Enter keeps defaults; otherwise values can be manually entered for min volume, spread cap, lookback days, capital, leverage, hold time, charges, cooldown range, and max open trades.
+=======
 The backtest runner can now execute multiple strategy variants in one run and records the strategy name in both console output and CSVs:
 - `mhr_trailing_rr4`
 - `mhr_static_rr4`
 
 Use `--strategies` to select one or more variants.
+>>>>>>> main

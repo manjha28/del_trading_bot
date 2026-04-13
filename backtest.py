@@ -15,10 +15,13 @@ DEFAULT_BASE_URL = "https://api.india.delta.exchange"
 HTTP_TIMEOUT = 20
 BACKTEST_BUILD = "2026-04-13-mhr-trailing-partial"
 SUPPORTED_STRATEGIES = {"mhr_trailing_rr4"}
+<<<<<<< codex/analyze-repo-and-module-functionality-oy9m5e
+=======
 
 
 # Supported backtest variants for multi-hour-runner setup.
 SUPPORTED_STRATEGIES = {"mhr_static_rr4", "mhr_trailing_rr4"}
+>>>>>>> main
 
 
 def _http_get(url: str, params: dict[str, Any] | None = None) -> requests.Response:
@@ -338,7 +341,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest MHR trailing strategy")
     parser.add_argument("--symbols", nargs="*", help="Symbols to backtest (default: all live perpetual futures)")
     parser.add_argument("--strategies", nargs="*", default=["mhr_trailing_rr4"], help="Only mhr_trailing_rr4 is supported")
+<<<<<<< codex/analyze-repo-and-module-functionality-oy9m5e
+    parser.add_argument("--limit", type=int, default=1500, help="Hourly candle limit (used if --days/start-date not set)")
+    parser.add_argument("--days", type=int, default=30, help="Backtest lookback days when explicit dates are not provided")
+    parser.add_argument("--interactive", action="store_true", help="Prompt for soft-coded parameter overrides")
+=======
     parser.add_argument("--limit", type=int, default=1500)
+>>>>>>> main
     parser.add_argument("--start-date", help="UTC start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", help="UTC end date (YYYY-MM-DD)")
     parser.add_argument("--capital", type=float, default=100.0)
@@ -357,15 +366,55 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+
+
+def _prompt_with_default(label: str, current: Any, cast_fn):
+    raw = input(f"{label} [{current}]: ").strip()
+    if raw == "":
+        return current
+    try:
+        return cast_fn(raw)
+    except Exception:
+        print(f"Invalid input for {label}, using default {current}")
+        return current
+
+
+def apply_interactive_overrides(args: argparse.Namespace) -> argparse.Namespace:
+    print("\n=== Interactive Backtest Config (press Enter to keep defaults) ===")
+    args.min_volume = _prompt_with_default("Minimum volume (USD)", args.min_volume, float)
+    args.max_spread = _prompt_with_default("Max spread (%)", args.max_spread, float)
+    args.days = _prompt_with_default("Lookback days", args.days, int)
+    args.capital = _prompt_with_default("Capital per trade", args.capital, float)
+    args.leverage = _prompt_with_default("Leverage", args.leverage, float)
+    args.max_hold = _prompt_with_default("Max hold candles", args.max_hold, int)
+    args.charges = _prompt_with_default("Per-side charges", args.charges, float)
+    args.cooldown_min = _prompt_with_default("Cooldown min candles", args.cooldown_min, int)
+    args.cooldown_max = _prompt_with_default("Cooldown max candles", args.cooldown_max, int)
+    args.max_open_trades = _prompt_with_default("Max open trades", args.max_open_trades, int)
+    return args
+
 def main() -> None:
     print(f"Backtest build: {BACKTEST_BUILD}")
     args = parse_args()
+<<<<<<< codex/analyze-repo-and-module-functionality-oy9m5e
+    if args.interactive:
+        args = apply_interactive_overrides(args)
+=======
+>>>>>>> main
 
     if set(args.strategies) - SUPPORTED_STRATEGIES:
         raise ValueError(f"Unsupported strategy list. Allowed: {sorted(SUPPORTED_STRATEGIES)}")
 
+<<<<<<< codex/analyze-repo-and-module-functionality-oy9m5e
+    end_ts = _to_unix_ts_utc(args.end_date, end_of_day=True) if args.end_date else int(time.time())
+    if args.start_date:
+        start_ts = _to_unix_ts_utc(args.start_date)
+    else:
+        start_ts = end_ts - (args.days * 24 * 60 * 60)
+=======
     start_ts = _to_unix_ts_utc(args.start_date) if args.start_date else None
     end_ts = _to_unix_ts_utc(args.end_date, end_of_day=True) if args.end_date else None
+>>>>>>> main
 
     symbols = args.symbols or fetch_live_perpetual_symbols(args.base_url)
     market_stats = fetch_market_stats(args.base_url)
