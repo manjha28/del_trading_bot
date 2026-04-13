@@ -421,6 +421,7 @@ def load_symbol_performance_filter(path: str) -> set[str] | None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest MHR trailing strategy")
     parser.add_argument("--symbols", nargs="*", help="Symbols to backtest (default: all live perpetual futures)")
+    parser.add_argument("--strategies", nargs="*", default=["mhr_trailing_rr4"], help="Only mhr_trailing_rr4 is supported")
     parser.add_argument("--strategies", nargs="*", default=["mhr_trailing_rr4", "mhr_rsi"], help="Strategies: mhr_trailing_rr4 (legacy), mhr_rsi (new filters)")
     parser.add_argument("--limit", type=int, default=1500, help="Hourly candle limit (used if --days/start-date not set)")
     parser.add_argument("--days", type=int, default=30, help="Backtest lookback days when explicit dates are not provided")
