@@ -1,6 +1,7 @@
 import argparse
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -51,15 +52,29 @@ def fetch_live_perpetual_symbols(base_url: str = DEFAULT_BASE_URL) -> list[str]:
     ]
 
 
-def fetch_hourly_candles(symbol: str, limit: int = 1500, base_url: str = DEFAULT_BASE_URL) -> pd.DataFrame:
-    end_ts = int(time.time())
-    start_ts = end_ts - (60 * 60 * limit)
+def _to_unix_ts_utc(date_str: str, end_of_day: bool = False) -> int:
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    if end_of_day:
+        dt = dt.replace(hour=23, minute=59, second=59)
+    dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+def fetch_hourly_candles(
+    symbol: str,
+    limit: int = 1500,
+    base_url: str = DEFAULT_BASE_URL,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> pd.DataFrame:
+    resolved_end_ts = end_ts if end_ts is not None else int(time.time())
+    resolved_start_ts = start_ts if start_ts is not None else resolved_end_ts - (60 * 60 * limit)
 
     params = {
         "symbol": symbol,
         "resolution": "1h",
-        "start": start_ts,
-        "end": end_ts,
+        "start": resolved_start_ts,
+        "end": resolved_end_ts,
     }
     response = _http_get(f"{base_url}/v2/history/candles", params=params)
 
@@ -156,6 +171,17 @@ def backtest_symbol(symbol: str, candles: pd.DataFrame, config: BacktestConfig) 
     return trades
 
 
+def _max_drawdown_from_pnl(trades: pd.DataFrame) -> float:
+    if trades.empty:
+        return 0.0
+
+    ordered = trades.sort_values("exit_time").reset_index(drop=True)
+    equity = ordered["pnl"].cumsum()
+    running_peak = equity.cummax()
+    drawdown = equity - running_peak
+    return float(drawdown.min())
+
+
 def build_summary(all_trades: pd.DataFrame) -> pd.DataFrame:
     if all_trades.empty:
         return pd.DataFrame()
@@ -169,23 +195,68 @@ def build_summary(all_trades: pd.DataFrame) -> pd.DataFrame:
         avg_roi=("roi_on_capital", "mean"),
     )
     grouped["win_rate"] = grouped["wins"] / grouped["trades"]
-    return grouped.sort_values("total_pnl", ascending=False).reset_index(drop=True)
+
+    drawdowns = (
+        all_trades.groupby("symbol")[["exit_time", "pnl"]]
+        .apply(_max_drawdown_from_pnl)
+        .reset_index(name="max_drawdown")
+    )
+
+    merged = grouped.merge(drawdowns, on="symbol", how="left")
+    return merged.sort_values("total_pnl", ascending=False).reset_index(drop=True)
+
+
+def build_overall_stats(all_trades: pd.DataFrame) -> pd.DataFrame:
+    if all_trades.empty:
+        return pd.DataFrame()
+
+    trades = len(all_trades)
+    wins = int((all_trades["pnl"] > 0).sum())
+    losses = int((all_trades["pnl"] <= 0).sum())
+    total_pnl = float(all_trades["pnl"].sum())
+    avg_pnl = float(all_trades["pnl"].mean())
+    win_rate = wins / trades if trades else 0.0
+    max_drawdown = _max_drawdown_from_pnl(all_trades)
+
+    return pd.DataFrame(
+        [
+            {
+                "trades": trades,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "total_pnl": total_pnl,
+                "avg_pnl": avg_pnl,
+                "max_drawdown": max_drawdown,
+            }
+        ]
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest five-green-candles short strategy on Delta futures")
     parser.add_argument("--symbols", nargs="*", help="Symbols to backtest (default: all live perpetual futures)")
-    parser.add_argument("--limit", type=int, default=1500, help="Number of hourly candles to request")
+    parser.add_argument("--limit", type=int, default=1500, help="Number of hourly candles to request when start/end not provided")
+    parser.add_argument("--start-date", help="UTC start date (YYYY-MM-DD), inclusive")
+    parser.add_argument("--end-date", help="UTC end date (YYYY-MM-DD), inclusive")
     parser.add_argument("--capital", type=float, default=100.0, help="Capital deployed per trade")
     parser.add_argument("--leverage", type=float, default=20.0, help="Leverage used to convert capital targets to price")
     parser.add_argument("--max-hold", type=int, default=24, help="Max candles to hold before forced exit")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Delta API base URL")
     parser.add_argument("--output", default="backtest_trades.csv", help="CSV path for trade-level results")
+    parser.add_argument("--summary-output", default="backtest_summary.csv", help="CSV path for per-symbol summary")
+    parser.add_argument("--overall-output", default="backtest_overall.csv", help="CSV path for overall metrics")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    start_ts = _to_unix_ts_utc(args.start_date) if args.start_date else None
+    end_ts = _to_unix_ts_utc(args.end_date, end_of_day=True) if args.end_date else None
+
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        raise ValueError("--start-date cannot be later than --end-date")
 
     symbols = args.symbols or fetch_live_perpetual_symbols(base_url=args.base_url)
 
@@ -198,7 +269,13 @@ def main() -> None:
     trade_rows: list[dict[str, Any]] = []
     for symbol in symbols:
         try:
-            candles = fetch_hourly_candles(symbol=symbol, limit=args.limit, base_url=args.base_url)
+            candles = fetch_hourly_candles(
+                symbol=symbol,
+                limit=args.limit,
+                base_url=args.base_url,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
             symbol_trades = backtest_symbol(symbol, candles, config)
             trade_rows.extend(symbol_trades)
             print(f"{symbol}: {len(symbol_trades)} trades")
@@ -212,10 +289,19 @@ def main() -> None:
 
     all_trades.to_csv(args.output, index=False)
     summary = build_summary(all_trades)
+    overall = build_overall_stats(all_trades)
 
-    print("\n=== SUMMARY ===")
+    summary.to_csv(args.summary_output, index=False)
+    overall.to_csv(args.overall_output, index=False)
+
+    print("\n=== OVERALL ===")
+    print(overall.to_string(index=False))
+    print("\n=== BY SYMBOL (sorted by total_pnl) ===")
     print(summary.to_string(index=False))
+
     print(f"\nSaved trade log: {args.output}")
+    print(f"Saved symbol summary: {args.summary_output}")
+    print(f"Saved overall metrics: {args.overall_output}")
 
 
 if __name__ == "__main__":
