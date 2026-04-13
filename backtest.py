@@ -328,6 +328,54 @@ def build_summary(all_trades: pd.DataFrame) -> pd.DataFrame:
     )
     return grouped.merge(dd, on=["strategy", "symbol"], how="left")
 
+    dd = (
+        all_trades.groupby(["strategy", "symbol"])[["exit_time", "net_pnl"]]
+        .apply(lambda g: _max_drawdown_from_pnl(g, pnl_col="net_pnl"))
+        .reset_index(name="max_drawdown")
+    )
+    return grouped.merge(dd, on=["strategy", "symbol"], how="left")
+
+
+def build_overall_stats(all_trades: pd.DataFrame) -> pd.DataFrame:
+    if all_trades.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for strategy, s in all_trades.groupby("strategy"):
+        rows.append(
+            {
+                "strategy": strategy,
+                "trades": len(s),
+                "wins": int((s["net_pnl"] > 0).sum()),
+                "losses": int((s["net_pnl"] <= 0).sum()),
+                "win_rate": float((s["net_pnl"] > 0).mean()),
+                "total_net_pnl": float(s["net_pnl"].sum()),
+                "avg_net_pnl": float(s["net_pnl"].mean()),
+                "total_fees": float(s["fees"].sum()),
+                "max_drawdown": _max_drawdown_from_pnl(s, "net_pnl"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+
+
+def load_symbol_performance_filter(path: str) -> set[str] | None:
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+
+    required = {"symbol", "trades", "win_rate"}
+    if not required.issubset(df.columns):
+        return None
+
+    pnl_col = "total_net_pnl" if "total_net_pnl" in df.columns else ("total_pnl" if "total_pnl" in df.columns else None)
+    if pnl_col is None:
+        return None
+
+    keep = df[(df[pnl_col] > 0) & (df["win_rate"] > 0.40) & (df["trades"] >= 20)]
+    return set(keep["symbol"].astype(str).tolist())
 
 def build_overall_stats(all_trades: pd.DataFrame) -> pd.DataFrame:
     if all_trades.empty:
