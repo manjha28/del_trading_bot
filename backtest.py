@@ -17,6 +17,10 @@ BACKTEST_BUILD = "2026-04-13-mhr-trailing-partial"
 SUPPORTED_STRATEGIES = {"mhr_trailing_rr4"}
 
 
+# Supported backtest variants for multi-hour-runner setup.
+SUPPORTED_STRATEGIES = {"mhr_static_rr4", "mhr_trailing_rr4"}
+
+
 def _http_get(url: str, params: dict[str, Any] | None = None) -> requests.Response:
     with requests.Session() as session:
         session.trust_env = False
