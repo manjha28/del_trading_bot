@@ -142,7 +142,25 @@ def entry_candle_rejection_ok(candle: pd.Series) -> tuple[bool, float]:
     return upper_wick > body, ratio
 
 
-def mhr_entry_filters(
+
+
+def mhr_basic_entry_filters(prepared: pd.DataFrame, entry_idx: int, lookback: int) -> Optional[dict]:
+    if entry_idx < lookback:
+        return None
+    setup = prepared.iloc[entry_idx - lookback:entry_idx]
+    if not exhaustion_setup_ok(setup):
+        return None
+    entry = prepared.iloc[entry_idx]
+    return {
+        "setup_start_time": setup.iloc[0]["time"],
+        "setup_end_time": setup.iloc[-1]["time"],
+        "entry_candle_time": entry["time"],
+        "ema_distance_pct": None,
+        "rsi14": None,
+        "wick_body_ratio": None,
+    }
+
+def mhr_rsi_entry_filters(
     prepared: pd.DataFrame,
     entry_idx: int,
     lookback: int,
@@ -205,7 +223,7 @@ def multihour_runner_short_signal(
     prepared["rsi14"] = calculate_rsi(prepared["close"], 14)
 
     entry_idx = len(prepared) - 1
-    filter_info = mhr_entry_filters(prepared, entry_idx, lookback)
+    filter_info = mhr_rsi_entry_filters(prepared, entry_idx, lookback)
     if not filter_info:
         return None
 
@@ -231,3 +249,8 @@ def multihour_runner_short_signal(
         "strategy": "multihour_runner_short",
         **filter_info,
     }
+
+
+# Backward compatibility alias
+def mhr_entry_filters(prepared: pd.DataFrame, entry_idx: int, lookback: int, min_ema_overextension_pct: float = 2.0, min_rsi: float = 65.0):
+    return mhr_rsi_entry_filters(prepared, entry_idx, lookback, min_ema_overextension_pct, min_rsi)

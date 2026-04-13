@@ -14,13 +14,14 @@ from strategy_short import (
     calculate_ema,
     calculate_rsi,
     calculate_sl_tp_prices,
-    mhr_entry_filters,
+    mhr_basic_entry_filters,
+    mhr_rsi_entry_filters,
 )
 
 DEFAULT_BASE_URL = "https://api.india.delta.exchange"
 HTTP_TIMEOUT = 20
-BACKTEST_BUILD = "2026-04-13-mhr-trailing-partial"
-SUPPORTED_STRATEGIES = {"mhr_trailing_rr4"}
+BACKTEST_BUILD = "2026-04-13-mhr-dual-strategy"
+SUPPORTED_STRATEGIES = {"mhr_trailing_rr4", "mhr_rsi"}
 
 
 def _http_get(url: str, params: dict[str, Any] | None = None) -> requests.Response:
@@ -235,7 +236,10 @@ def backtest_symbol(
         setup = prepared.iloc[idx - lookback: idx]
         entry = prepared.iloc[idx]
 
-        filter_info = mhr_entry_filters(prepared, idx, lookback)
+        if strategy_name == "mhr_rsi":
+            filter_info = mhr_rsi_entry_filters(prepared, idx, lookback)
+        else:
+            filter_info = mhr_basic_entry_filters(prepared, idx, lookback)
         if not filter_info:
             idx += 1
             continue
@@ -324,6 +328,54 @@ def build_summary(all_trades: pd.DataFrame) -> pd.DataFrame:
     )
     return grouped.merge(dd, on=["strategy", "symbol"], how="left")
 
+    dd = (
+        all_trades.groupby(["strategy", "symbol"])[["exit_time", "net_pnl"]]
+        .apply(lambda g: _max_drawdown_from_pnl(g, pnl_col="net_pnl"))
+        .reset_index(name="max_drawdown")
+    )
+    return grouped.merge(dd, on=["strategy", "symbol"], how="left")
+
+
+def build_overall_stats(all_trades: pd.DataFrame) -> pd.DataFrame:
+    if all_trades.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for strategy, s in all_trades.groupby("strategy"):
+        rows.append(
+            {
+                "strategy": strategy,
+                "trades": len(s),
+                "wins": int((s["net_pnl"] > 0).sum()),
+                "losses": int((s["net_pnl"] <= 0).sum()),
+                "win_rate": float((s["net_pnl"] > 0).mean()),
+                "total_net_pnl": float(s["net_pnl"].sum()),
+                "avg_net_pnl": float(s["net_pnl"].mean()),
+                "total_fees": float(s["fees"].sum()),
+                "max_drawdown": _max_drawdown_from_pnl(s, "net_pnl"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+
+
+def load_symbol_performance_filter(path: str) -> set[str] | None:
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+
+    required = {"symbol", "trades", "win_rate"}
+    if not required.issubset(df.columns):
+        return None
+
+    pnl_col = "total_net_pnl" if "total_net_pnl" in df.columns else ("total_pnl" if "total_pnl" in df.columns else None)
+    if pnl_col is None:
+        return None
+
+    keep = df[(df[pnl_col] > 0) & (df["win_rate"] > 0.40) & (df["trades"] >= 20)]
+    return set(keep["symbol"].astype(str).tolist())
 
 def build_overall_stats(all_trades: pd.DataFrame) -> pd.DataFrame:
     if all_trades.empty:
@@ -369,10 +421,7 @@ def load_symbol_performance_filter(path: str) -> set[str] | None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest MHR trailing strategy")
     parser.add_argument("--symbols", nargs="*", help="Symbols to backtest (default: all live perpetual futures)")
-    parser.add_argument("--strategies", nargs="*", default=["mhr_trailing_rr4"], help="Only mhr_trailing_rr4 is supported")
-    parser.add_argument("--limit", type=int, default=1500, help="Hourly candle limit (used if --days/start-date not set)")
-    parser.add_argument("--days", type=int, default=30, help="Backtest lookback days when explicit dates are not provided")
-    parser.add_argument("--interactive", action="store_true", help="Prompt for soft-coded parameter overrides")
+    parser.add_argument("--strategies", nargs="*", default=["mhr_trailing_rr4", "mhr_rsi"], help="Strategies: mhr_trailing_rr4 (legacy), mhr_rsi (new filters)")
     parser.add_argument("--limit", type=int, default=1500, help="Hourly candle limit (used if --days/start-date not set)")
     parser.add_argument("--days", type=int, default=30, help="Backtest lookback days when explicit dates are not provided")
     parser.add_argument("--interactive", action="store_true", help="Prompt for soft-coded parameter overrides")
@@ -425,8 +474,6 @@ def apply_interactive_overrides(args: argparse.Namespace) -> argparse.Namespace:
 def main() -> None:
     print(f"Backtest build: {BACKTEST_BUILD}")
     args = parse_args()
-    if args.interactive:
-        args = apply_interactive_overrides(args)
     if args.interactive:
         args = apply_interactive_overrides(args)
 
