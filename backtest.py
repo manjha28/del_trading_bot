@@ -9,19 +9,18 @@ from typing import Any
 import pandas as pd
 import requests
 
-from strategy_short import MultiHourRunnerConfig, calculate_sl_tp_prices, is_multihour_runner_trigger
+from strategy_short import (
+    MultiHourRunnerConfig,
+    calculate_ema,
+    calculate_rsi,
+    calculate_sl_tp_prices,
+    mhr_entry_filters,
+)
 
 DEFAULT_BASE_URL = "https://api.india.delta.exchange"
 HTTP_TIMEOUT = 20
 BACKTEST_BUILD = "2026-04-13-mhr-trailing-partial"
 SUPPORTED_STRATEGIES = {"mhr_trailing_rr4"}
-<<<<<<< codex/analyze-repo-and-module-functionality-oy9m5e
-=======
-
-
-# Supported backtest variants for multi-hour-runner setup.
-SUPPORTED_STRATEGIES = {"mhr_static_rr4", "mhr_trailing_rr4"}
->>>>>>> main
 
 
 def _http_get(url: str, params: dict[str, Any] | None = None) -> requests.Response:
@@ -34,7 +33,7 @@ def _http_get(url: str, params: dict[str, Any] | None = None) -> requests.Respon
 
 @dataclass
 class BacktestConfig:
-    lookback_green_candles: int = 5
+    lookback_green_candles: int = 4
     capital_deployed: float = 100.0
     leverage: float = 20.0
     sl_capital_pct: float = 0.05
@@ -213,6 +212,11 @@ def backtest_symbol(
     if candles.empty or len(candles) < lookback + 2:
         return trades
 
+    prepared = candles.copy().sort_values("time").reset_index(drop=True)
+    prepared["ema20"] = calculate_ema(prepared["close"], 20)
+    prepared["ema50"] = calculate_ema(prepared["close"], 50)
+    prepared["rsi14"] = calculate_rsi(prepared["close"], 14)
+
     strategy_cfg = MultiHourRunnerConfig(
         lookback_green_candles=lookback,
         capital_deployed=config.capital_deployed,
@@ -228,12 +232,14 @@ def backtest_symbol(
         if open_trade_slots <= 0:
             break
 
-        setup = candles.iloc[idx - lookback: idx]
-        if not is_multihour_runner_trigger(setup):
+        setup = prepared.iloc[idx - lookback: idx]
+        entry = prepared.iloc[idx]
+
+        filter_info = mhr_entry_filters(prepared, idx, lookback)
+        if not filter_info:
             idx += 1
             continue
 
-        entry = candles.iloc[idx]
         entry_price = float(entry["open"])
 
         try:
@@ -243,7 +249,7 @@ def backtest_symbol(
             continue
 
         partial_pnl, rest_pnl, exit_reason, exit_time, final_sl, bars_held, qty_partial = _simulate_mhr_trailing_partial_exit(
-            candles=candles,
+            candles=prepared,
             entry_idx=idx,
             entry_price=entry_price,
             initial_sl=sl_price,
@@ -269,6 +275,10 @@ def backtest_symbol(
                 "target_price_rr4": tp_rr4,
                 "qty": qty,
                 "partial_qty_at_2r": qty_partial,
+                "partial_tp_hit": bool(qty_partial > 0 and partial_pnl > 0),
+                "ema_distance_pct": filter_info["ema_distance_pct"],
+                "rsi14": filter_info["rsi14"],
+                "wick_body_ratio": filter_info["wick_body_ratio"],
                 "bars_held": bars_held,
                 "gross_pnl": gross_pnl,
                 "fees": fees,
@@ -337,17 +347,35 @@ def build_overall_stats(all_trades: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+
+def load_symbol_performance_filter(path: str) -> set[str] | None:
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+
+    required = {"symbol", "trades", "win_rate"}
+    if not required.issubset(df.columns):
+        return None
+
+    pnl_col = "total_net_pnl" if "total_net_pnl" in df.columns else ("total_pnl" if "total_pnl" in df.columns else None)
+    if pnl_col is None:
+        return None
+
+    keep = df[(df[pnl_col] > 0) & (df["win_rate"] > 0.40) & (df["trades"] >= 20)]
+    return set(keep["symbol"].astype(str).tolist())
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest MHR trailing strategy")
     parser.add_argument("--symbols", nargs="*", help="Symbols to backtest (default: all live perpetual futures)")
     parser.add_argument("--strategies", nargs="*", default=["mhr_trailing_rr4"], help="Only mhr_trailing_rr4 is supported")
-<<<<<<< codex/analyze-repo-and-module-functionality-oy9m5e
     parser.add_argument("--limit", type=int, default=1500, help="Hourly candle limit (used if --days/start-date not set)")
     parser.add_argument("--days", type=int, default=30, help="Backtest lookback days when explicit dates are not provided")
     parser.add_argument("--interactive", action="store_true", help="Prompt for soft-coded parameter overrides")
-=======
-    parser.add_argument("--limit", type=int, default=1500)
->>>>>>> main
+    parser.add_argument("--limit", type=int, default=1500, help="Hourly candle limit (used if --days/start-date not set)")
+    parser.add_argument("--days", type=int, default=30, help="Backtest lookback days when explicit dates are not provided")
+    parser.add_argument("--interactive", action="store_true", help="Prompt for soft-coded parameter overrides")
     parser.add_argument("--start-date", help="UTC start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", help="UTC end date (YYYY-MM-DD)")
     parser.add_argument("--capital", type=float, default=100.0)
@@ -360,6 +388,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cooldown-max", type=int, default=5)
     parser.add_argument("--max-open-trades", type=int, default=5)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--performance-file", default="backtest_summary.csv", help="Historical summary CSV for symbol-quality filtering")
     parser.add_argument("--output", default="backtest_trades.csv")
     parser.add_argument("--summary-output", default="backtest_summary.csv")
     parser.add_argument("--overall-output", default="backtest_overall.csv")
@@ -396,25 +425,19 @@ def apply_interactive_overrides(args: argparse.Namespace) -> argparse.Namespace:
 def main() -> None:
     print(f"Backtest build: {BACKTEST_BUILD}")
     args = parse_args()
-<<<<<<< codex/analyze-repo-and-module-functionality-oy9m5e
     if args.interactive:
         args = apply_interactive_overrides(args)
-=======
->>>>>>> main
+    if args.interactive:
+        args = apply_interactive_overrides(args)
 
     if set(args.strategies) - SUPPORTED_STRATEGIES:
         raise ValueError(f"Unsupported strategy list. Allowed: {sorted(SUPPORTED_STRATEGIES)}")
 
-<<<<<<< codex/analyze-repo-and-module-functionality-oy9m5e
     end_ts = _to_unix_ts_utc(args.end_date, end_of_day=True) if args.end_date else int(time.time())
     if args.start_date:
         start_ts = _to_unix_ts_utc(args.start_date)
     else:
         start_ts = end_ts - (args.days * 24 * 60 * 60)
-=======
-    start_ts = _to_unix_ts_utc(args.start_date) if args.start_date else None
-    end_ts = _to_unix_ts_utc(args.end_date, end_of_day=True) if args.end_date else None
->>>>>>> main
 
     symbols = args.symbols or fetch_live_perpetual_symbols(args.base_url)
     market_stats = fetch_market_stats(args.base_url)
@@ -429,6 +452,10 @@ def main() -> None:
         if spread is not None and spread > args.max_spread:
             continue
         filtered_symbols.append(s)
+
+    perf_allowlist = load_symbol_performance_filter(args.performance_file)
+    if perf_allowlist is not None:
+        filtered_symbols = [s for s in filtered_symbols if s in perf_allowlist]
 
     config = BacktestConfig(
         capital_deployed=args.capital,
@@ -468,6 +495,9 @@ def main() -> None:
     print(overall.to_string(index=False))
     print("\n=== SUMMARY ===")
     print(summary.to_string(index=False))
+
+    print("\n=== EXIT REASON DISTRIBUTION ===")
+    print(all_trades["exit_reason"].value_counts(dropna=False).to_string())
 
     print(f"\nSaved trades: {args.output}")
     print(f"Saved summary: {args.summary_output}")
