@@ -373,6 +373,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=1500, help="Hourly candle limit (used if --days/start-date not set)")
     parser.add_argument("--days", type=int, default=30, help="Backtest lookback days when explicit dates are not provided")
     parser.add_argument("--interactive", action="store_true", help="Prompt for soft-coded parameter overrides")
+    parser.add_argument("--limit", type=int, default=1500, help="Hourly candle limit (used if --days/start-date not set)")
+    parser.add_argument("--days", type=int, default=30, help="Backtest lookback days when explicit dates are not provided")
+    parser.add_argument("--interactive", action="store_true", help="Prompt for soft-coded parameter overrides")
     parser.add_argument("--start-date", help="UTC start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", help="UTC end date (YYYY-MM-DD)")
     parser.add_argument("--capital", type=float, default=100.0)
@@ -422,6 +425,8 @@ def apply_interactive_overrides(args: argparse.Namespace) -> argparse.Namespace:
 def main() -> None:
     print(f"Backtest build: {BACKTEST_BUILD}")
     args = parse_args()
+    if args.interactive:
+        args = apply_interactive_overrides(args)
     if args.interactive:
         args = apply_interactive_overrides(args)
 
