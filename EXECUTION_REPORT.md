@@ -240,3 +240,11 @@ env | grep -Ei 'http_proxy|https_proxy|no_proxy'
 ```
 
 In Python, this repo disables proxy inheritance in `scanner.py` and `backtest.py` sessions (`session.trust_env = False`), so proxy-only networks may require code/config adjustments.
+
+## Backtest strategies now supported
+
+The backtest runner can now execute multiple strategy variants in one run and records the strategy name in both console output and CSVs:
+- `mhr_trailing_rr4`
+- `mhr_static_rr4`
+
+Use `--strategies` to select one or more variants.
