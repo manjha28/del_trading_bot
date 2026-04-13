@@ -36,8 +36,12 @@ class BacktestConfig:
     capital_deployed: float = 100.0
     leverage: float = 20.0
     sl_capital_pct: float = 0.05
+<<<<<<< HEAD
     pt_capital_pct: float = 1.0
     min_rr: float = 4.0
+=======
+    pt_capital_pct: float = 0.20
+>>>>>>> cc7cfba (my changes)
     max_holding_candles: int = 24
     charge_rate: float = 0.0005  # 0.05% per side
 
