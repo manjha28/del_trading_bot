@@ -206,7 +206,7 @@ def backtest_symbol(
     symbol: str,
     candles: pd.DataFrame,
     config: BacktestConfig,
-    strategy_name: str = "mhr_trailing_rr4",
+    strategy_name: str,
 ) -> list[dict[str, Any]]:
     trades: list[dict[str, Any]] = []
     lookback = config.lookback_green_candles
@@ -286,6 +286,17 @@ def backtest_symbol(
     return trades
 
 
+def _max_drawdown_from_pnl(trades: pd.DataFrame) -> float:
+    if trades.empty:
+        return 0.0
+
+    ordered = trades.sort_values("exit_time").reset_index(drop=True)
+    equity = ordered["pnl"].cumsum()
+    running_peak = equity.cummax()
+    drawdown = equity - running_peak
+    return float(drawdown.min())
+
+
 def build_summary(all_trades: pd.DataFrame) -> pd.DataFrame:
     if all_trades.empty:
         return pd.DataFrame()
@@ -302,47 +313,46 @@ def build_summary(all_trades: pd.DataFrame) -> pd.DataFrame:
     grouped["win_rate"] = grouped["wins"] / grouped["trades"]
 
     drawdowns = (
-        all_trades.groupby(["strategy", "symbol"])[["exit_time", "net_pnl"]]
-        .apply(lambda g: _max_drawdown_from_pnl(g, pnl_col="net_pnl"))
+        all_trades.groupby("symbol")[["exit_time", "pnl"]]
+        .apply(_max_drawdown_from_pnl)
         .reset_index(name="max_drawdown")
     )
 
-    merged = grouped.merge(drawdowns, on=["strategy", "symbol"], how="left")
-    return merged.sort_values(["strategy", "total_net_pnl"], ascending=[True, False]).reset_index(drop=True)
+    merged = grouped.merge(drawdowns, on="symbol", how="left")
+    return merged.sort_values("total_pnl", ascending=False).reset_index(drop=True)
 
 
 def build_overall_stats(all_trades: pd.DataFrame) -> pd.DataFrame:
     if all_trades.empty:
         return pd.DataFrame()
 
-    rows: list[dict[str, Any]] = []
-    for strategy_name, strat_df in all_trades.groupby("strategy"):
-        trades = len(strat_df)
-        wins = int((strat_df["net_pnl"] > 0).sum())
-        losses = int((strat_df["net_pnl"] <= 0).sum())
+    trades = len(all_trades)
+    wins = int((all_trades["pnl"] > 0).sum())
+    losses = int((all_trades["pnl"] <= 0).sum())
+    total_pnl = float(all_trades["pnl"].sum())
+    avg_pnl = float(all_trades["pnl"].mean())
+    win_rate = wins / trades if trades else 0.0
+    max_drawdown = _max_drawdown_from_pnl(all_trades)
 
-        rows.append(
+    return pd.DataFrame(
+        [
             {
-                "strategy": strategy_name,
                 "trades": trades,
                 "wins": wins,
                 "losses": losses,
-                "win_rate": wins / trades if trades else 0.0,
-                "total_net_pnl": float(strat_df["net_pnl"].sum()),
-                "avg_net_pnl": float(strat_df["net_pnl"].mean()),
-                "total_fees": float(strat_df["fees"].sum()),
-                "max_drawdown": _max_drawdown_from_pnl(strat_df, pnl_col="net_pnl"),
+                "win_rate": win_rate,
+                "total_pnl": total_pnl,
+                "avg_pnl": avg_pnl,
+                "max_drawdown": max_drawdown,
             }
-        )
-
-    return pd.DataFrame(rows).sort_values("total_net_pnl", ascending=False).reset_index(drop=True)
+        ]
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest multi-strategy short models on Delta futures")
     parser.add_argument("--symbols", nargs="*", help="Symbols to backtest (default: all live perpetual futures)")
-    parser.add_argument("--strategies", nargs="*", default=["mhr_trailing_rr4", "mhr_static_rr4"], help=f"Strategies to run: {sorted(SUPPORTED_STRATEGIES)}")
-    parser.add_argument("--limit", type=int, default=1500, help="Hourly candles to request if start/end not provided")
+    parser.add_argument("--limit", type=int, default=1500, help="Number of hourly candles to request when start/end not provided")
     parser.add_argument("--start-date", help="UTC start date (YYYY-MM-DD), inclusive")
     parser.add_argument("--end-date", help="UTC end date (YYYY-MM-DD), inclusive")
     parser.add_argument("--capital", type=float, default=100.0, help="Capital deployed per trade")
@@ -351,8 +361,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--charges", type=float, default=0.0005, help="Per-side charge rate (default 0.0005 = 0.05%%)")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Delta API base URL")
     parser.add_argument("--output", default="backtest_trades.csv", help="CSV path for trade-level results")
-    parser.add_argument("--summary-output", default="backtest_summary.csv", help="CSV path for strategy/symbol summary")
-    parser.add_argument("--overall-output", default="backtest_overall.csv", help="CSV path for strategy-level overall metrics")
+    parser.add_argument("--summary-output", default="backtest_summary.csv", help="CSV path for per-symbol summary")
+    parser.add_argument("--overall-output", default="backtest_overall.csv", help="CSV path for overall metrics")
     return parser.parse_args()
 
 
@@ -364,11 +374,6 @@ def main() -> None:
 
     if start_ts is not None and end_ts is not None and start_ts > end_ts:
         raise ValueError("--start-date cannot be later than --end-date")
-
-    selected_strategies = args.strategies or ["mhr_trailing_rr4", "mhr_static_rr4"]
-    unknown = sorted(set(selected_strategies) - SUPPORTED_STRATEGIES)
-    if unknown:
-        raise ValueError(f"Unknown strategies: {unknown}. Supported: {sorted(SUPPORTED_STRATEGIES)}")
 
     symbols = args.symbols or fetch_live_perpetual_symbols(base_url=args.base_url)
 
@@ -389,10 +394,9 @@ def main() -> None:
                 start_ts=start_ts,
                 end_ts=end_ts,
             )
-            for strategy_name in selected_strategies:
-                symbol_trades = backtest_symbol(symbol, candles, config, strategy_name)
-                trade_rows.extend(symbol_trades)
-                print(f"{symbol} | {strategy_name}: {len(symbol_trades)} trades")
+            symbol_trades = backtest_symbol(symbol, candles, config)
+            trade_rows.extend(symbol_trades)
+            print(f"{symbol}: {len(symbol_trades)} trades")
         except Exception as exc:
             print(f"{symbol}: skipped due to error -> {exc}")
 
@@ -408,14 +412,13 @@ def main() -> None:
     summary.to_csv(args.summary_output, index=False)
     overall.to_csv(args.overall_output, index=False)
 
-    print("\n=== OVERALL BY STRATEGY ===")
+    print("\n=== OVERALL ===")
     print(overall.to_string(index=False))
-    print("\n=== BY STRATEGY + SYMBOL ===")
+    print("\n=== BY SYMBOL (sorted by total_pnl) ===")
     print(summary.to_string(index=False))
 
-    print(f"\nStrategies run: {', '.join(selected_strategies)}")
-    print(f"Saved trade log: {args.output}")
-    print(f"Saved summary: {args.summary_output}")
+    print(f"\nSaved trade log: {args.output}")
+    print(f"Saved symbol summary: {args.summary_output}")
     print(f"Saved overall metrics: {args.overall_output}")
 
 
