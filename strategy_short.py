@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -69,7 +70,7 @@ def short_signal(df: pd.DataFrame, config: EMAShortConfig = EMA_DEFAULT_CONFIG) 
     }
 
 
-# ================= MULTI-HOUR RUNNER STRATEGY (new strategy, separate function name) ================= #
+# ================= MULTI-HOUR RUNNER STRATEGY ================= #
 
 @dataclass(frozen=True)
 class MultiHourRunnerConfig:
@@ -78,15 +79,18 @@ class MultiHourRunnerConfig:
     leverage: float = 20.0
     sl_capital_pct: float = 0.05
     pt_capital_pct: float = 1.0
+    min_rr: float = 4.0
 
 
 MULTI_HOUR_DEFAULT_CONFIG = MultiHourRunnerConfig()
 
 
-def calculate_sl_tp_prices(entry_price: float, config: MultiHourRunnerConfig) -> tuple[float, float, float]:
+def calculate_sl_tp_prices(entry_price: float, config: MultiHourRunnerConfig) -> tuple[float, float, int]:
     """
     Convert capital-based SL/PT targets into short-futures price levels.
-    qty = (capital_deployed * leverage) / entry_price
+
+    Quantity is floored to whole lots only.
+    qty = floor((capital_deployed * leverage) / entry_price)
     pnl = (entry_price - exit_price) * qty
     """
     if entry_price <= 0:
@@ -94,13 +98,20 @@ def calculate_sl_tp_prices(entry_price: float, config: MultiHourRunnerConfig) ->
     if config.capital_deployed <= 0 or config.leverage <= 0:
         raise ValueError("capital_deployed and leverage must be > 0")
 
-    qty = (config.capital_deployed * config.leverage) / entry_price
+    raw_qty = (config.capital_deployed * config.leverage) / entry_price
+    qty = math.floor(raw_qty)
+    if qty < 1:
+        raise ValueError("effective quantity < 1 lot; increase capital/leverage or choose lower price instrument")
+
     sl_loss_amount = config.capital_deployed * config.sl_capital_pct
-    pt_profit_amount = config.capital_deployed * config.pt_capital_pct
+    target_profit_amount = max(
+        config.capital_deployed * config.pt_capital_pct,
+        sl_loss_amount * config.min_rr,
+    )
 
     sl_price = entry_price + (sl_loss_amount / qty)
-    tp_price = entry_price - (pt_profit_amount / qty)
-    return sl_price, tp_price, qty
+    tp_price = entry_price - (target_profit_amount / qty)
+    return float(sl_price), float(tp_price), int(qty)
 
 
 def _validate_multihour_dataframe(df: pd.DataFrame, lookback: int) -> bool:
@@ -123,11 +134,10 @@ def multihour_runner_short_signal(
     config: MultiHourRunnerConfig = MULTI_HOUR_DEFAULT_CONFIG,
 ) -> Optional[dict]:
     """
-    New strategy:
-    - If past 5 hourly candles are bullish (close > open),
-      short at open of next candle.
-    - SL = 5% of capital deployed.
-    - PT = 100% of capital deployed.
+    Multi-hour runner short setup:
+    - If past N hourly candles are bullish (close > open), short at open of next candle.
+    - Quantity is whole lots only (floored).
+    - Minimum RR is enforced by config.min_rr (default 1:4).
     """
     lookback = config.lookback_green_candles
     if not _validate_multihour_dataframe(df, lookback):
@@ -141,16 +151,23 @@ def multihour_runner_short_signal(
         return None
 
     entry_price = float(entry_candle["open"])
-    sl_price, tp_price, qty = calculate_sl_tp_prices(entry_price, config)
+    try:
+        sl_price, tp_price, qty = calculate_sl_tp_prices(entry_price, config)
+    except ValueError:
+        return None
+
+    risk_per_unit = sl_price - entry_price
+    rr = (entry_price - tp_price) / risk_per_unit if risk_per_unit > 0 else None
 
     return {
         "signal": "SHORT",
         "entry": entry_price,
         "stop_loss": float(sl_price),
         "take_profit": float(tp_price),
-        "quantity": float(qty),
+        "quantity": int(qty),
         "capital_deployed": float(config.capital_deployed),
         "leverage": float(config.leverage),
+        "risk_reward": float(rr) if rr is not None else None,
         "setup_start_time": setup.iloc[0]["time"],
         "setup_end_time": setup.iloc[-1]["time"],
         "entry_candle_time": entry_candle["time"],
