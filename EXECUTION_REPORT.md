@@ -243,6 +243,7 @@ In Python, this repo disables proxy inheritance in `scanner.py` and `backtest.py
 
 ## Backtest strategies now supported
 
+<<<<<<< codex/analyze-repo-and-module-functionality-oy9m5e
 Current default strategy set has been simplified to only:
 - `mhr_trailing_rr4`
 
@@ -274,3 +275,10 @@ Backtest now supports both:
 - soft-coded user input mode via `--interactive`.
 
 In interactive mode, pressing Enter keeps defaults; otherwise values can be manually entered for min volume, spread cap, lookback days, capital, leverage, hold time, charges, cooldown range, and max open trades.
+=======
+The backtest runner can now execute multiple strategy variants in one run and records the strategy name in both console output and CSVs:
+- `mhr_trailing_rr4`
+- `mhr_static_rr4`
+
+Use `--strategies` to select one or more variants.
+>>>>>>> main
