@@ -100,6 +100,61 @@ def sl_tp_qty(
     return float(sl_price), float(tp_price), int(qty)
 
 
+def structural_sl_tp_qty(
+    entry_price: float,
+    prev_high: float,
+    config: MHRConfig,
+    capital: float | None = None,
+    atr_value: float | None = None,
+    use_pump_atr: bool = False,
+) -> tuple[float, float, int]:
+    """
+    Compute SL, TP, and qty using the previous candle high as the stop level.
+
+    SL is placed at prev_high (no buffer).
+    qty = floor(max_loss / (prev_high − entry_price)).
+
+    Falls back to sl_tp_qty() (ATR-based) when:
+      - prev_high ≤ entry_price (gap-up; structure is below entry)
+      - resulting qty < 1 (candle wick too wide for the given capital)
+
+    Parameters
+    ----------
+    entry_price  : Short entry price.
+    prev_high    : High of the candle immediately before the entry candle.
+    config       : MHRConfig instance.
+    capital      : Trade capital override; defaults to config.capital_deployed.
+    atr_value    : Current ATR value passed through to fallback sl_tp_qty().
+    use_pump_atr : Passed through to fallback sl_tp_qty().
+
+    Returns
+    -------
+    (sl_price, tp_price, qty)
+
+    Raises
+    ------
+    ValueError if both structural and ATR sizing fail to produce qty ≥ 1.
+    """
+    if entry_price <= 0:
+        raise ValueError(f"entry_price must be positive, got {entry_price}")
+    cap = capital if capital is not None else config.capital_deployed
+    if cap <= 0:
+        raise ValueError(f"capital must be positive, got {cap}")
+
+    if prev_high > entry_price:
+        sl_dist = prev_high - entry_price
+        max_loss = cap * config.sl_capital_pct
+        raw_qty = math.floor(max_loss / sl_dist)
+        if raw_qty >= 1:
+            qty = min(raw_qty, math.floor(cap * config.leverage / entry_price))
+            if qty >= 1:
+                tp_target = max(cap * config.pt_capital_pct, max_loss * config.min_rr)
+                tp_price = entry_price - tp_target / qty
+                return float(prev_high), float(tp_price), int(qty)
+
+    return sl_tp_qty(entry_price, config, capital, atr_value, use_pump_atr)
+
+
 def cap_pnl(net_pnl: float, trade_cap: float, config: MHRConfig) -> float:
     """
     Clamp net PnL to [-trade_cap, trade_cap × max_pnl_impact_pct].

@@ -35,7 +35,7 @@ exit.py        simulate_trailing_exit — trailing exit simulator
 from .config import MHRConfig
 from .indicators import ema, rsi, atr, candle_volume_usd
 from .fees import calculate_fees, BTC_ETH_SYMBOLS
-from .sizing import trade_capital, sl_tp_qty, cap_pnl
+from .sizing import trade_capital, sl_tp_qty, structural_sl_tp_qty, cap_pnl
 from .entry import (
     entry_signal,
     detect_pump,
@@ -60,6 +60,7 @@ __all__ = [
     "simulate_trailing_exit",
     # Sizing
     "sl_tp_qty",
+    "structural_sl_tp_qty",
     "trade_capital",
     "cap_pnl",
     # Fees
