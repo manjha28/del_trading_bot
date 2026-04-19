@@ -3,7 +3,7 @@ import math
 import time
 import json
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 
 import requests
 import pandas as pd
@@ -24,11 +24,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Runtime config ────────────────────────────────────────────────────────────
 AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "6"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
 MIN_BALANCE = float(os.getenv("MIN_BALANCE_TO_TRADE", "10.0"))
 
+# Hard cap on total capital deployed from the live wallet.
+# Exchange auto-liquidates at 50% wallet loss ($5); guard fires at 40% ($4).
+MAX_LIVE_CAPITAL = 10.0
+LIQ_GUARD_USD = MAX_LIVE_CAPITAL * 0.40  # $4.00 — emergency close threshold
+
+# ── Telegram ──────────────────────────────────────────────────────────────────
+# Set these in .env:
+#   TELEGRAM_BOT_TOKEN=<your bot token from @BotFather>
+#   TELEGRAM_CHAT_ID=<your personal chat id — send any message to your bot,
+#                    then call https://api.telegram.org/bot<TOKEN>/getUpdates>
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ── Strategy config ───────────────────────────────────────────────────────────
 CONFIG = UnifiedShortConfig(
     lookback_green_candles=4,
     min_pump_pct=50.0,
@@ -44,25 +59,52 @@ CONFIG = UnifiedShortConfig(
 
 MAX_HOLD = 24
 COOLDOWN_SECONDS = 1 * 3600
-MIN_VOLUME_USD = 5_000_000
+SCAN_INTERVAL = 3600          # 1 hour
+MIN_VOLUME_USD = 100_000
 MAX_SPREAD_PCT = 0.5
-ALLOWED_SYMBOLS: set[str] = set()
 STATE_FILE = "trade_state.json"
 BASE_URL = "https://api.india.delta.exchange"
 
+
+# ── Telegram helper ───────────────────────────────────────────────────────────
+
+def send_telegram(msg: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        with requests.Session() as s:
+            s.trust_env = False
+            s.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                timeout=10,
+            )
+    except Exception as e:
+        logger.warning(f"Telegram alert failed: {e}")
+
+
+# ── State persistence ─────────────────────────────────────────────────────────
 
 def load_state():
     try:
         with open(STATE_FILE) as f:
             return json.load(f)
     except Exception:
-        return {"trade_count": 0, "last_trade_day": "", "next_trade_allowed_ts": 0, "watching": {}}
+        return {
+            "trade_count": 0,
+            "last_trade_day": "",
+            "next_trade_allowed_ts": 0,
+            "watching": {},
+            "last_signal_candles": {},   # symbol → last candle timestamp that fired a signal
+        }
 
 
 def save_state(s):
     with open(STATE_FILE, "w") as f:
         json.dump(s, f, indent=2, default=str)
 
+
+# ── Exchange helpers ──────────────────────────────────────────────────────────
 
 def get_balance(asset="USDT"):
     if not is_authenticated():
@@ -200,7 +242,9 @@ def place_brackets(pid, qty, entry, sl):
     return result
 
 
-def manage_trailing(pid, bracket, entry_ts):
+# ── Trade management ──────────────────────────────────────────────────────────
+
+def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD):
     entry = bracket["entry"]
     risk = bracket["risk"]
     sl_id = bracket["sl_id"]
@@ -232,7 +276,12 @@ def manage_trailing(pid, bracket, entry_ts):
             continue
         if not partial_done and tp_id and tp_id not in live:
             partial_done = True
-            logger.info("2R partial filled!")
+            logger.info(f"{symbol}: 2R partial filled!")
+            send_telegram(
+                f"<b>PARTIAL TP HIT</b> — {symbol}\n"
+                f"50% closed at 2R\n"
+                f"Trailing remainder with SL at breakeven"
+            )
             if sl_id: cancel(pid, sl_id)
             if q2 > 0:
                 resp = place_sl(pid, q2, trail_sl)
@@ -250,6 +299,26 @@ def manage_trailing(pid, bracket, entry_ts):
                 for t in r.json().get("result", []):
                     if t.get("product_id") == pid:
                         price = float(t.get("mark_price") or t.get("close"))
+
+                        # Liquidation guard: close immediately if unrealized loss
+                        # approaches the exchange's 50%-wallet auto-liquidation level.
+                        unrealized_loss = max(0.0, (price - entry) * size)
+                        if unrealized_loss >= liq_guard_usd:
+                            logger.warning(
+                                f"LIQUIDATION GUARD {symbol}: loss ${unrealized_loss:.2f} "
+                                f">= guard ${liq_guard_usd:.2f} — emergency close"
+                            )
+                            send_telegram(
+                                f"<b>LIQUIDATION GUARD TRIGGERED</b>\n"
+                                f"Symbol: {symbol}\n"
+                                f"Unrealized loss: ${unrealized_loss:.4f} >= guard ${liq_guard_usd:.2f}\n"
+                                f"Emergency market close sent!"
+                            )
+                            if sl_id: cancel(pid, sl_id)
+                            if tp_id: cancel(pid, tp_id)
+                            market_close(pid, int(size))
+                            return {"exit_reason": "LIQ_GUARD", "sl_hit": False}
+
                         if risk > 0:
                             cur_r = (entry - price) / risk
                             best_r = max(best_r, cur_r)
@@ -268,28 +337,59 @@ def manage_trailing(pid, bracket, entry_ts):
             pass
 
 
-def execute_trade(pid, sig):
+def execute_trade(pid, symbol, sig):
     if not is_authenticated():
         return None
     logger.info(
-        f"{sig.get('entry_path', 'UNKNOWN')} SHORT @ {sig['entry']:.6f} | "
-        f"SL={sig['stop_loss']:.6f} | qty={sig['quantity']} | "
-        f"pump={sig.get('pump_pct', 0):.1f}%"
+        f"{symbol} {sig.get('entry_path', 'UNKNOWN')} SHORT @ {sig['entry']:.6f} | "
+        f"SL={sig['stop_loss']:.6f} ({sig.get('sl_method','?')}) | qty={sig['quantity']}"
     )
+
+    # Alert: signal about to be executed
+    send_telegram(
+        f"<b>SIGNAL — MHR_EXHAUSTION SHORT</b>\n"
+        f"Symbol: <b>{symbol}</b>\n"
+        f"Entry: {sig['entry']:.6f}\n"
+        f"SL: {sig['stop_loss']:.6f} ({sig.get('sl_method', '?')})\n"
+        f"TP: {sig['take_profit']:.6f}\n"
+        f"Qty: {sig['quantity']} | Cap: ${sig['trade_capital']:.2f}\n"
+        f"4 consecutive green candles — pump exhaustion short"
+    )
+
     if not AUTO_EXECUTE:
         if input("Execute? (y/n): ").strip().lower() != "y":
             return None
+
     resp = place_entry(pid, sig["quantity"], sig["entry"])
     if not resp:
+        send_telegram(f"<b>ENTRY FAILED</b> — {symbol}\nOrder placement returned no response.")
         return None
     oid = resp.get("result", {}).get("id")
     if not oid or not wait_fill(pid, oid):
+        send_telegram(f"<b>ENTRY NOT FILLED</b> — {symbol}\nOrder cancelled after 120s timeout.")
         return None
+
     bracket = place_brackets(pid, sig["quantity"], sig["entry"], sig["stop_loss"])
-    result = manage_trailing(pid, bracket, time.time())
-    logger.info(f"Closed: {result}")
+    send_telegram(
+        f"<b>TRADE OPENED</b> — {symbol}\n"
+        f"Entry filled @ {sig['entry']:.6f}\n"
+        f"SL @ {sig['stop_loss']:.6f} | TP @ {bracket['entry'] - 2*bracket['risk']:.6f}\n"
+        f"Qty: {sig['quantity']} | Risk: ${bracket['risk'] * sig['quantity']:.4f}"
+    )
+
+    result = manage_trailing(pid, symbol, bracket, time.time())
+    logger.info(f"{symbol} closed: {result}")
+
+    exit_reason = result.get("exit_reason", "UNKNOWN")
+    send_telegram(
+        f"<b>TRADE CLOSED</b> — {symbol}\n"
+        f"Exit: {exit_reason}\n"
+        f"{'SL hit — watching for reentry' if result.get('sl_hit') else 'Position closed'}"
+    )
     return result
 
+
+# ── Main scan loop ────────────────────────────────────────────────────────────
 
 def run():
     state = load_state()
@@ -297,27 +397,31 @@ def run():
     if state.get("last_trade_day") != today:
         state["trade_count"] = 0
         state["last_trade_day"] = today
+        state["last_signal_candles"] = {}
 
-    if int(time.time()) < state.get("next_trade_allowed_ts", 0):
-        return
-    if open_positions() >= MAX_OPEN_TRADES:
-        return
-    if state["trade_count"] >= MAX_TRADES_PER_DAY:
-        return
+    cooldown_remaining = state.get("next_trade_allowed_ts", 0) - int(time.time())
+    at_max_positions = open_positions() >= MAX_OPEN_TRADES
+    at_daily_limit = state["trade_count"] >= MAX_TRADES_PER_DAY
 
     bal = get_balance("USDT")
-    if bal < MIN_BALANCE:
-        return
-    cap = calculate_trade_capital(bal, CONFIG)
-    if cap < 5.0:
-        return
+    cap = min(calculate_trade_capital(bal, CONFIG), MAX_LIVE_CAPITAL)
 
-    logger.info(f"Wallet: ${bal:.2f} | Trade: ${cap:.2f}")
+    can_trade = (
+        cooldown_remaining <= 0
+        and not at_max_positions
+        and not at_daily_limit
+        and bal >= MIN_BALANCE
+        and cap >= 1.0
+    )
+
+    logger.info(
+        f"Scan start | wallet=${bal:.2f} cap=${cap:.2f} "
+        f"trades={state['trade_count']}/{MAX_TRADES_PER_DAY} "
+        f"{'[COOLDOWN]' if cooldown_remaining > 0 else ''}"
+        f"{'[MAX_POS]' if at_max_positions else ''}"
+    )
 
     futures = get_live_perpetual_futures()
-    if ALLOWED_SYMBOLS:
-        futures = [f for f in futures if f["symbol"] in ALLOWED_SYMBOLS]
-
     stats = get_market_stats()
     filtered = []
     for f in futures:
@@ -333,11 +437,10 @@ def run():
     logger.info(f"Scanning {len(filtered)} symbols...")
 
     watching = state.get("watching", {})
+    last_signal_candles = state.get("last_signal_candles", {})
+    signals_found = []
 
     for f in filtered:
-        if state["trade_count"] >= MAX_TRADES_PER_DAY:
-            break
-
         symbol = f["symbol"]
         candles = fetch_candles(symbol, "1h", 100)
         if candles.empty:
@@ -347,6 +450,11 @@ def run():
         prepared["ema20"] = calculate_ema(prepared["close"], 20)
         prepared["rsi14"] = calculate_rsi(prepared["close"], 14)
         prepared["atr14"] = calculate_atr(prepared, 14)
+
+        # Duplicate-candle guard: don't re-fire on the same 1h candle we already acted on.
+        last_candle_ts = str(prepared.iloc[-1]["time"])
+        if last_signal_candles.get(symbol) == last_candle_ts:
+            continue
 
         watch = watching.get(symbol)
         is_reentry = watch is not None and watch.get("reentries", 0) < CONFIG.max_reentries
@@ -360,24 +468,59 @@ def run():
 
         if not filter_info:
             continue
+        if filter_info.get("entry_path") != "MHR_EXHAUSTION":
+            continue
 
-        entry_price = float(prepared.iloc[-1]["open"])
-        atr = float(prepared.iloc[-1]["atr14"])
+        # Mark this candle as seen for this symbol regardless of whether we trade.
+        last_signal_candles[symbol] = last_candle_ts
+
+        entry_price = float(prepared.iloc[-1]["close"])
+        atr = float(prepared.iloc[-1]["atr14"]) if "atr14" in prepared.columns else 0.0
         use_pump_atr = filter_info.get("use_pump_atr", False)
 
-        try:
-            sl, tp, qty = calculate_sl_tp_prices(entry_price, CONFIG, cap, atr, use_pump_atr)
-        except ValueError:
+        # Structural SL: SL at prev candle high (no buffer), qty from max loss / sl_dist.
+        # Falls back to ATR if prev_high <= entry_price (gap-up) or qty resolves to 0.
+        prev_high = float(prepared.iloc[-2]["high"]) if len(prepared) >= 2 else 0.0
+        sl = tp = 0.0
+        qty = 0
+        sl_method = "atr"
+
+        if prev_high > entry_price:
+            _max_loss = cap * CONFIG.sl_capital_pct
+            _raw = math.floor(_max_loss / (prev_high - entry_price))
+            if _raw >= 1:
+                _cap_qty = math.floor(cap * CONFIG.leverage / entry_price)
+                _qty = min(_raw, _cap_qty)
+                if _qty >= 1:
+                    sl = prev_high
+                    qty = _qty
+                    sl_method = "structural"
+                    _tp_target = max(cap * CONFIG.pt_capital_pct, _max_loss * CONFIG.min_rr)
+                    tp = entry_price - _tp_target / qty
+
+        if sl_method == "atr":
+            try:
+                sl, tp, qty = calculate_sl_tp_prices(entry_price, CONFIG, cap, atr, use_pump_atr)
+            except ValueError:
+                continue
+
+        signals_found.append(symbol)
+
+        if not can_trade or state["trade_count"] >= MAX_TRADES_PER_DAY:
+            logger.info(f"{symbol}: signal found but cannot trade now")
             continue
 
         sig = {
             "entry": entry_price, "stop_loss": sl, "take_profit": tp,
-            "quantity": qty, "trade_capital": cap,
+            "quantity": qty, "trade_capital": cap, "sl_method": sl_method,
             **filter_info,
         }
+        logger.info(
+            f"{symbol} | MHR_EXHAUSTION | SL={sl_method} | "
+            f"entry={entry_price:.6f} sl={sl:.6f} qty={qty} cap=${cap:.2f}"
+        )
 
-        logger.info(f"{symbol} | {filter_info.get('entry_path')}: SIGNAL")
-        result = execute_trade(f["product_id"], sig)
+        result = execute_trade(f["product_id"], symbol, sig)
 
         if result:
             state["trade_count"] += 1
@@ -394,10 +537,39 @@ def run():
                     del watching[symbol]
 
             state["watching"] = watching
+            state["last_signal_candles"] = last_signal_candles
             save_state(state)
             bal = get_balance("USDT")
-            cap = calculate_trade_capital(bal, CONFIG)
-            break
+            cap = min(calculate_trade_capital(bal, CONFIG), MAX_LIVE_CAPITAL)
+            can_trade = (
+                state.get("next_trade_allowed_ts", 0) <= int(time.time())
+                and open_positions() < MAX_OPEN_TRADES
+                and state["trade_count"] < MAX_TRADES_PER_DAY
+                and bal >= MIN_BALANCE
+                and cap >= 1.0
+            )
+
+    # ── Scan complete: send Telegram summary ─────────────────────────────────
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    status_parts = []
+    if cooldown_remaining > 0:
+        status_parts.append(f"Cooldown {cooldown_remaining//60}m remaining")
+    if at_max_positions:
+        status_parts.append("Max positions open")
+    if at_daily_limit:
+        status_parts.append("Daily trade limit reached")
+    status_str = " | ".join(status_parts) if status_parts else "Ready to trade"
+
+    summary_msg = (
+        f"<b>Scan complete</b> — {now_str}\n"
+        f"Scanned: {len(filtered)} symbols\n"
+        f"Signals found: {len(signals_found)}"
+        + (f" ({', '.join(signals_found)})" if signals_found else "")
+        + f"\nWallet: ${bal:.2f} | Trades today: {state['trade_count']}/{MAX_TRADES_PER_DAY}\n"
+        f"Status: {status_str}"
+    )
+    send_telegram(summary_msg)
+    logger.info(f"Scan complete — {len(filtered)} symbols, {len(signals_found)} signals: {signals_found}")
 
     # Clean expired watches
     for sym in list(watching.keys()):
@@ -408,18 +580,27 @@ def run():
                 del watching[sym]
 
     state["watching"] = watching
+    state["last_signal_candles"] = last_signal_candles
     save_state(state)
 
 
 if __name__ == "__main__":
-    logger.info("Starting unified MHR + Pump short trader...")
+    logger.info("Starting MHR pump short trader (30-min scan)...")
+    send_telegram(
+        "<b>Bot started</b>\n"
+        f"Strategy: MHR_EXHAUSTION SHORT\n"
+        f"Scan interval: every 30 minutes\n"
+        f"Capital cap: ${MAX_LIVE_CAPITAL:.2f} | Liq guard: ${LIQ_GUARD_USD:.2f}"
+    )
     while True:
         try:
             run()
         except KeyboardInterrupt:
+            send_telegram("<b>Bot stopped</b> — KeyboardInterrupt")
             break
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
-        sleep_s = 3600 - (time.time() % 3600) + 5
-        logger.info(f"Sleep {sleep_s:.0f}s")
+            send_telegram(f"<b>Bot error</b>\n{type(e).__name__}: {e}")
+        sleep_s = SCAN_INTERVAL - (time.time() % SCAN_INTERVAL) + 5
+        logger.info(f"Next scan in {sleep_s:.0f}s")
         time.sleep(sleep_s)
