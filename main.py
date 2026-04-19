@@ -260,82 +260,90 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
     while True:
         time.sleep(60)
         try:
-            pos = client.get_position(pid)
-            size = abs(float(pos.get("size", 0))) if pos else 0
-        except Exception:
-            size = 0
-        if size == 0:
-            return {"exit_reason": "CLOSED", "sl_hit": False}
-        if time.time() >= deadline:
-            if sl_id: cancel(pid, sl_id)
-            if tp_id: cancel(pid, tp_id)
-            market_close(pid, int(size))
-            return {"exit_reason": "MAX_HOLD", "sl_hit": False}
-        try:
-            live = [o["id"] for o in client.get_live_orders()]
-        except Exception:
-            continue
-        if not partial_done and tp_id and tp_id not in live:
-            partial_done = True
-            logger.info(f"{symbol}: 2R partial filled!")
-            send_telegram(
-                f"<b>PARTIAL TP HIT</b> — {symbol}\n"
-                f"50% closed at 2R\n"
-                f"Trailing remainder with SL at breakeven"
-            )
-            if sl_id: cancel(pid, sl_id)
-            if q2 > 0:
-                resp = place_sl(pid, q2, trail_sl)
-                if resp:
-                    try: sl_id = resp.get("result", {}).get("id")
-                    except: pass
-        if sl_id and sl_id not in live:
-            if tp_id and tp_id in live: cancel(pid, tp_id)
-            return {"exit_reason": "TRAIL" if partial_done else "SL_HIT",
-                    "sl_hit": not partial_done}
-        try:
-            with requests.Session() as sess:
-                sess.trust_env = False
-                r = sess.get(f"{BASE_URL}/v2/tickers", timeout=10)
-                for t in r.json().get("result", []):
-                    if t.get("product_id") == pid:
-                        price = float(t.get("mark_price") or t.get("close"))
+            try:
+                pos = client.get_position(pid)
+                size = abs(float(pos.get("size", 0))) if pos else 0
+            except Exception:
+                size = 0
 
-                        # Liquidation guard: close immediately if unrealized loss
-                        # approaches the exchange's 50%-wallet auto-liquidation level.
-                        unrealized_loss = max(0.0, (price - entry) * size)
-                        if unrealized_loss >= liq_guard_usd:
-                            logger.warning(
-                                f"LIQUIDATION GUARD {symbol}: loss ${unrealized_loss:.2f} "
-                                f">= guard ${liq_guard_usd:.2f} — emergency close"
-                            )
-                            send_telegram(
-                                f"<b>LIQUIDATION GUARD TRIGGERED</b>\n"
-                                f"Symbol: {symbol}\n"
-                                f"Unrealized loss: ${unrealized_loss:.4f} >= guard ${liq_guard_usd:.2f}\n"
-                                f"Emergency market close sent!"
-                            )
-                            if sl_id: cancel(pid, sl_id)
-                            if tp_id: cancel(pid, tp_id)
-                            market_close(pid, int(size))
-                            return {"exit_reason": "LIQ_GUARD", "sl_hit": False}
+            if size == 0:
+                return {"exit_reason": "CLOSED", "sl_hit": False}
+            if time.time() >= deadline:
+                if sl_id: cancel(pid, sl_id)
+                if tp_id: cancel(pid, tp_id)
+                market_close(pid, int(size))
+                return {"exit_reason": "MAX_HOLD", "sl_hit": False}
 
-                        if risk > 0:
-                            cur_r = (entry - price) / risk
-                            best_r = max(best_r, cur_r)
-                            if best_r > 1.0:
-                                new_sl = entry - (best_r - 1.0) * risk
-                                if new_sl < trail_sl:
-                                    trail_sl = new_sl
-                                    if sl_id: cancel(pid, sl_id)
-                                    remain = q2 if partial_done else bracket["total_qty"]
-                                    resp = place_sl(pid, remain, trail_sl)
-                                    if resp:
-                                        try: sl_id = resp.get("result", {}).get("id")
-                                        except: pass
-                        break
-        except Exception:
-            pass
+            try:
+                live = [o["id"] for o in client.get_live_orders()]
+            except Exception:
+                continue
+
+            if not partial_done and tp_id and tp_id not in live:
+                partial_done = True
+                logger.info(f"{symbol}: 2R partial filled!")
+                send_telegram(
+                    f"<b>PARTIAL TP HIT</b> — {symbol}\n"
+                    f"50% closed at 2R\n"
+                    f"Trailing remainder with SL at breakeven"
+                )
+                if sl_id: cancel(pid, sl_id)
+                if q2 > 0:
+                    resp = place_sl(pid, q2, trail_sl)
+                    if resp:
+                        try: sl_id = resp.get("result", {}).get("id")
+                        except: pass
+
+            if sl_id and sl_id not in live:
+                if tp_id and tp_id in live: cancel(pid, tp_id)
+                return {"exit_reason": "TRAIL" if partial_done else "SL_HIT",
+                        "sl_hit": not partial_done}
+
+            try:
+                with requests.Session() as sess:
+                    sess.trust_env = False
+                    r = sess.get(f"{BASE_URL}/v2/tickers", timeout=10)
+                    for t in r.json().get("result", []):
+                        if t.get("product_id") == pid:
+                            price = float(t.get("mark_price") or t.get("close"))
+
+                            unrealized_loss = max(0.0, (price - entry) * size)
+                            if unrealized_loss >= liq_guard_usd:
+                                logger.warning(
+                                    f"LIQUIDATION GUARD {symbol}: loss ${unrealized_loss:.2f} "
+                                    f">= guard ${liq_guard_usd:.2f} — emergency close"
+                                )
+                                send_telegram(
+                                    f"<b>LIQUIDATION GUARD TRIGGERED</b>\n"
+                                    f"Symbol: {symbol}\n"
+                                    f"Unrealized loss: ${unrealized_loss:.4f} >= guard ${liq_guard_usd:.2f}\n"
+                                    f"Emergency market close sent!"
+                                )
+                                if sl_id: cancel(pid, sl_id)
+                                if tp_id: cancel(pid, tp_id)
+                                market_close(pid, int(size))
+                                return {"exit_reason": "LIQ_GUARD", "sl_hit": False}
+
+                            if risk > 0:
+                                cur_r = (entry - price) / risk
+                                best_r = max(best_r, cur_r)
+                                if best_r > 1.0:
+                                    new_sl = entry - (best_r - 1.0) * risk
+                                    if new_sl < trail_sl:
+                                        trail_sl = new_sl
+                                        if sl_id: cancel(pid, sl_id)
+                                        remain = q2 if partial_done else bracket["total_qty"]
+                                        resp = place_sl(pid, remain, trail_sl)
+                                        if resp:
+                                            try: sl_id = resp.get("result", {}).get("id")
+                                            except: pass
+                            break
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error(f"manage_trailing unexpected error ({symbol}): {e}")
+            send_telegram(f"<b>Trade monitor error</b> — {symbol}\n{type(e).__name__}: {e}\nStill watching position.")
 
 
 def execute_trade(pid, symbol, sig):
@@ -422,8 +430,20 @@ def run():
         f"{'[MAX_POS]' if at_max_positions else ''}"
     )
 
-    futures = get_live_perpetual_futures()
-    stats = get_market_stats()
+    try:
+        futures = get_live_perpetual_futures()
+    except Exception as e:
+        msg = f"Failed to fetch futures list: {e}"
+        logger.error(msg)
+        send_telegram(f"<b>Scan error</b>\n{msg}\nWill retry next hour.")
+        return
+
+    try:
+        stats = get_market_stats()
+    except Exception as e:
+        logger.warning(f"Market stats failed ({e}) — scanning without volume/spread filter")
+        stats = {}
+
     filtered = []
     for f in futures:
         st = stats.get(f["symbol"], {})
@@ -443,112 +463,124 @@ def run():
 
     for f in filtered:
         symbol = f["symbol"]
-        candles = fetch_candles(symbol, "1h", 100)
-        if candles.empty:
-            continue
-
-        prepared = candles.copy().sort_values("time").reset_index(drop=True)
-        prepared["ema20"] = calculate_ema(prepared["close"], 20)
-        prepared["rsi14"] = calculate_rsi(prepared["close"], 14)
-        prepared["atr14"] = calculate_atr(prepared, 14)
-
-        # Duplicate-candle guard: don't re-fire on the same 1h candle we already acted on.
-        last_candle_ts = str(prepared.iloc[-1]["time"])
-        if last_signal_candles.get(symbol) == last_candle_ts:
-            continue
-
-        watch = watching.get(symbol)
-        is_reentry = watch is not None and watch.get("reentries", 0) < CONFIG.max_reentries
-        prev_entry = watch.get("last_entry", 0) if watch else 0
-
-        idx = len(prepared) - 1
-        filter_info = unified_entry_filter(
-            prepared, idx, CONFIG,
-            is_reentry=is_reentry, previous_entry_price=prev_entry
-        )
-
-        if not filter_info:
-            continue
-        if filter_info.get("entry_path") != "MHR_EXHAUSTION":
-            continue
-
-        # Mark this candle as seen for this symbol regardless of whether we trade.
-        last_signal_candles[symbol] = last_candle_ts
-
-        entry_price = float(prepared.iloc[-1]["close"])
-        atr = float(prepared.iloc[-1]["atr14"]) if "atr14" in prepared.columns else 0.0
-        use_pump_atr = filter_info.get("use_pump_atr", False)
-
-        # Structural SL: SL at prev candle high (no buffer), qty from max loss / sl_dist.
-        # Falls back to ATR if prev_high <= entry_price (gap-up) or qty resolves to 0.
-        prev_high = float(prepared.iloc[-2]["high"]) if len(prepared) >= 2 else 0.0
-        sl = tp = 0.0
-        qty = 0
-        sl_method = "atr"
-
-        if prev_high > entry_price:
-            _max_loss = cap * CONFIG.sl_capital_pct
-            _raw = math.floor(_max_loss / (prev_high - entry_price))
-            if _raw >= 1:
-                _cap_qty = math.floor(cap * CONFIG.leverage / entry_price)
-                _qty = min(_raw, _cap_qty)
-                if _qty >= 1:
-                    sl = prev_high
-                    qty = _qty
-                    sl_method = "structural"
-                    _tp_target = max(cap * CONFIG.pt_capital_pct, _max_loss * CONFIG.min_rr)
-                    tp = entry_price - _tp_target / qty
-
-        if sl_method == "atr":
-            try:
-                sl, tp, qty = calculate_sl_tp_prices(entry_price, CONFIG, cap, atr, use_pump_atr)
-            except ValueError:
+        try:
+            candles = fetch_candles(symbol, "1h", 100)
+            if candles.empty:
                 continue
 
-        signals_found.append(symbol)
+            prepared = candles.copy().sort_values("time").reset_index(drop=True)
+            prepared["ema20"] = calculate_ema(prepared["close"], 20)
+            prepared["rsi14"] = calculate_rsi(prepared["close"], 14)
+            prepared["atr14"] = calculate_atr(prepared, 14)
 
-        if not can_trade or state["trade_count"] >= MAX_TRADES_PER_DAY:
-            logger.info(f"{symbol}: signal found but cannot trade now")
-            continue
+            # Duplicate-candle guard: don't re-fire on the same 1h candle we already acted on.
+            last_candle_ts = str(prepared.iloc[-1]["time"])
+            if last_signal_candles.get(symbol) == last_candle_ts:
+                continue
 
-        sig = {
-            "entry": entry_price, "stop_loss": sl, "take_profit": tp,
-            "quantity": qty, "trade_capital": cap, "sl_method": sl_method,
-            **filter_info,
-        }
-        logger.info(
-            f"{symbol} | MHR_EXHAUSTION | SL={sl_method} | "
-            f"entry={entry_price:.6f} sl={sl:.6f} qty={qty} cap=${cap:.2f}"
-        )
+            watch = watching.get(symbol)
+            is_reentry = watch is not None and watch.get("reentries", 0) < CONFIG.max_reentries
+            prev_entry = watch.get("last_entry", 0) if watch else 0
 
-        result = execute_trade(f["product_id"], symbol, sig)
-
-        if result:
-            state["trade_count"] += 1
-            state["next_trade_allowed_ts"] = int(time.time()) + COOLDOWN_SECONDS
-
-            if result.get("sl_hit"):
-                if symbol not in watching:
-                    watching[symbol] = {"reentries": 0}
-                watching[symbol]["reentries"] += 1
-                watching[symbol]["last_entry"] = entry_price
-                logger.info(f"{symbol}: SL hit — watching ({watching[symbol]['reentries']}/{CONFIG.max_reentries})")
-            else:
-                if symbol in watching:
-                    del watching[symbol]
-
-            state["watching"] = watching
-            state["last_signal_candles"] = last_signal_candles
-            save_state(state)
-            bal = get_balance("USDT")
-            cap = min(calculate_trade_capital(bal, CONFIG), MAX_LIVE_CAPITAL)
-            can_trade = (
-                state.get("next_trade_allowed_ts", 0) <= int(time.time())
-                and open_positions() < MAX_OPEN_TRADES
-                and state["trade_count"] < MAX_TRADES_PER_DAY
-                and bal >= MIN_BALANCE
-                and cap >= 1.0
+            idx = len(prepared) - 1
+            filter_info = unified_entry_filter(
+                prepared, idx, CONFIG,
+                is_reentry=is_reentry, previous_entry_price=prev_entry
             )
+
+            if not filter_info:
+                continue
+            if filter_info.get("entry_path") != "MHR_EXHAUSTION":
+                continue
+
+            # Mark this candle as seen for this symbol regardless of whether we trade.
+            last_signal_candles[symbol] = last_candle_ts
+
+            entry_price = float(prepared.iloc[-1]["close"])
+            atr = float(prepared.iloc[-1]["atr14"]) if "atr14" in prepared.columns else 0.0
+            use_pump_atr = filter_info.get("use_pump_atr", False)
+
+            # Structural SL: SL at prev candle high (no buffer), qty from max loss / sl_dist.
+            # Falls back to ATR if prev_high <= entry_price (gap-up) or qty resolves to 0.
+            prev_high = float(prepared.iloc[-2]["high"]) if len(prepared) >= 2 else 0.0
+            sl = tp = 0.0
+            qty = 0
+            sl_method = "atr"
+
+            if prev_high > entry_price:
+                _max_loss = cap * CONFIG.sl_capital_pct
+                _raw = math.floor(_max_loss / (prev_high - entry_price))
+                if _raw >= 1:
+                    _cap_qty = math.floor(cap * CONFIG.leverage / entry_price)
+                    _qty = min(_raw, _cap_qty)
+                    if _qty >= 1:
+                        sl = prev_high
+                        qty = _qty
+                        sl_method = "structural"
+                        _tp_target = max(cap * CONFIG.pt_capital_pct, _max_loss * CONFIG.min_rr)
+                        tp = entry_price - _tp_target / qty
+
+            if sl_method == "atr":
+                try:
+                    sl, tp, qty = calculate_sl_tp_prices(entry_price, CONFIG, cap, atr, use_pump_atr)
+                except ValueError:
+                    continue
+
+            signals_found.append(symbol)
+
+            if not can_trade or state["trade_count"] >= MAX_TRADES_PER_DAY:
+                logger.info(f"{symbol}: signal found but cannot trade now")
+                continue
+
+            sig = {
+                "entry": entry_price, "stop_loss": sl, "take_profit": tp,
+                "quantity": qty, "trade_capital": cap, "sl_method": sl_method,
+                **filter_info,
+            }
+            logger.info(
+                f"{symbol} | MHR_EXHAUSTION | SL={sl_method} | "
+                f"entry={entry_price:.6f} sl={sl:.6f} qty={qty} cap=${cap:.2f}"
+            )
+
+            try:
+                result = execute_trade(f["product_id"], symbol, sig)
+            except Exception as e:
+                err = f"{symbol} execute_trade error: {type(e).__name__}: {e}"
+                logger.error(err)
+                send_telegram(f"<b>Trade execution error</b>\n{err}\nSkipping — bot continues.")
+                continue
+
+            if result:
+                state["trade_count"] += 1
+                state["next_trade_allowed_ts"] = int(time.time()) + COOLDOWN_SECONDS
+
+                if result.get("sl_hit"):
+                    if symbol not in watching:
+                        watching[symbol] = {"reentries": 0}
+                    watching[symbol]["reentries"] += 1
+                    watching[symbol]["last_entry"] = entry_price
+                    logger.info(f"{symbol}: SL hit — watching ({watching[symbol]['reentries']}/{CONFIG.max_reentries})")
+                else:
+                    if symbol in watching:
+                        del watching[symbol]
+
+                state["watching"] = watching
+                state["last_signal_candles"] = last_signal_candles
+                save_state(state)
+                bal = get_balance("USDT")
+                cap = min(calculate_trade_capital(bal, CONFIG), MAX_LIVE_CAPITAL)
+                can_trade = (
+                    state.get("next_trade_allowed_ts", 0) <= int(time.time())
+                    and open_positions() < MAX_OPEN_TRADES
+                    and state["trade_count"] < MAX_TRADES_PER_DAY
+                    and bal >= MIN_BALANCE
+                    and cap >= 1.0
+                )
+
+        except Exception as e:
+            err = f"{symbol} scan error: {type(e).__name__}: {e}"
+            logger.error(err)
+            send_telegram(f"<b>Symbol scan error</b>\n{err}\nSkipping symbol — bot continues.")
 
     # ── Scan complete: send Telegram summary ─────────────────────────────────
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -574,11 +606,14 @@ def run():
 
     # Clean expired watches
     for sym in list(watching.keys()):
-        c = fetch_candles(sym, "1h", 30)
-        if not c.empty:
-            p = c.copy().sort_values("time").reset_index(drop=True)
-            if not is_pump_still_active(p, CONFIG):
-                del watching[sym]
+        try:
+            c = fetch_candles(sym, "1h", 30)
+            if not c.empty:
+                p = c.copy().sort_values("time").reset_index(drop=True)
+                if not is_pump_still_active(p, CONFIG):
+                    del watching[sym]
+        except Exception as e:
+            logger.warning(f"Watch cleanup error for {sym}: {e}")
 
     state["watching"] = watching
     state["last_signal_candles"] = last_signal_candles
@@ -586,11 +621,11 @@ def run():
 
 
 if __name__ == "__main__":
-    logger.info("Starting MHR pump short trader (30-min scan)...")
+    logger.info("Starting MHR pump short trader (1-hour scan)...")
     send_telegram(
         "<b>Bot started</b>\n"
         f"Strategy: MHR_EXHAUSTION SHORT\n"
-        f"Scan interval: every 30 minutes\n"
+        f"Scan interval: every 1 hour\n"
         f"Capital cap: ${MAX_LIVE_CAPITAL:.2f} | Liq guard: ${LIQ_GUARD_USD:.2f}"
     )
     while True:
