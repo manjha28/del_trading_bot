@@ -215,7 +215,8 @@ def wait_fill(pid, oid, timeout=120):
 
 def open_positions():
     try:
-        return len([p for p in client.get_positions() if abs(float(p.get("size", 0))) > 0])
+        r = client.request("GET", "/v2/positions/margined", auth=True).json()
+        return len([p for p in r.get("result", []) if abs(float(p.get("size", 0))) > 0])
     except Exception:
         return 0
 
