@@ -256,7 +256,7 @@ def check_margin_sufficient(entry_price, qty, bal, leverage):
     if entry_price <= 0 or qty <= 0 or bal <= 0:
         return False
     estimated_margin = (entry_price * qty) / leverage
-    available_for_margin = bal * 0.9
+    available_for_margin = bal * 0.20
     if estimated_margin > available_for_margin:
         logger.warning(
             f"Margin check failed: need ${estimated_margin:.2f}, "
