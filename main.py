@@ -34,6 +34,8 @@ LIQ_GUARD_USD = MAX_LIVE_CAPITAL * 0.40
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# How long to wait for Telegram confirmation before skipping (seconds)
+TELEGRAM_CONFIRM_TIMEOUT = int(os.getenv("TELEGRAM_CONFIRM_TIMEOUT", "120"))
 
 # ── Strategy config ───────────────────────────────────────────────────────────
 CONFIG = UnifiedShortConfig(
@@ -58,8 +60,12 @@ STATE_FILE = "trade_state.json"
 BASE_URL = "https://api.india.delta.exchange"
 
 
-# ── Telegram helper ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def send_telegram(msg: str) -> None:
+    """Send a message to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -74,7 +80,101 @@ def send_telegram(msg: str) -> None:
         logger.warning(f"Telegram alert failed: {e}")
 
 
-# ── State persistence ─────────────────────────────────────────────────────────
+def get_telegram_updates(offset: int = 0) -> list:
+    """Fetch new messages from Telegram bot."""
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    try:
+        with requests.Session() as s:
+            s.trust_env = False
+            r = s.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"offset": offset, "timeout": 5},
+                timeout=15,
+            )
+            data = r.json()
+            if data.get("ok"):
+                return data.get("result", [])
+    except Exception as e:
+        logger.warning(f"Telegram getUpdates failed: {e}")
+    return []
+
+
+def flush_telegram_updates() -> int:
+    """
+    Flush all pending Telegram messages and return the latest update_id + 1.
+    This ensures we only read NEW messages after sending the confirmation request.
+    """
+    updates = get_telegram_updates(offset=0)
+    if updates:
+        return updates[-1]["update_id"] + 1
+    return 0
+
+
+def wait_for_telegram_confirmation(symbol: str, timeout: int = 120) -> bool:
+    """
+    Wait for user to reply YES or NO via Telegram.
+    
+    Returns True if user replies with 'y', 'yes', 'go', 'execute'.
+    Returns False if user replies 'n', 'no', 'skip', 'cancel' or timeout.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        # No Telegram configured — fall back to terminal
+        try:
+            return input("Execute? (y/n): ").strip().lower() in ("y", "yes")
+        except EOFError:
+            return False
+
+    # Flush old messages so we only read new ones
+    offset = flush_telegram_updates()
+
+    send_telegram(
+        f"<b>⚡ CONFIRM TRADE — {symbol}</b>\n\n"
+        f"Reply with:\n"
+        f"  <b>YES</b> or <b>Y</b> — to execute\n"
+        f"  <b>NO</b> or <b>N</b> — to skip\n\n"
+        f"⏱ Auto-skip in {timeout} seconds if no response."
+    )
+
+    logger.info(f"Waiting for Telegram confirmation for {symbol} (timeout {timeout}s)...")
+
+    start = time.time()
+    while time.time() - start < timeout:
+        updates = get_telegram_updates(offset=offset)
+        for update in updates:
+            # Update offset so we don't process same message twice
+            offset = update["update_id"] + 1
+
+            msg = update.get("message", {})
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            text = (msg.get("text") or "").strip().lower()
+
+            # Only process messages from our chat
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                continue
+
+            if text in ("y", "yes", "go", "execute", "ok"):
+                send_telegram(f"✅ <b>Trade confirmed</b> — {symbol}\nExecuting now...")
+                logger.info(f"Telegram confirmation received: YES for {symbol}")
+                return True
+
+            if text in ("n", "no", "skip", "cancel", "stop"):
+                send_telegram(f"❌ <b>Trade skipped</b> — {symbol}")
+                logger.info(f"Telegram confirmation received: NO for {symbol}")
+                return False
+
+        time.sleep(2)
+
+    # Timeout
+    send_telegram(f"⏰ <b>Trade timed out</b> — {symbol}\nNo response in {timeout}s, skipping.")
+    logger.info(f"Telegram confirmation timeout for {symbol}")
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STATE PERSISTENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def load_state():
     try:
         with open(STATE_FILE) as f:
@@ -94,7 +194,10 @@ def save_state(s):
         json.dump(s, f, indent=2, default=str)
 
 
-# ── Exchange helpers ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXCHANGE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def get_balance(asset="USDT"):
     """
     Fetch wallet balance. Checks for both "USD" and "USDT" since
@@ -149,12 +252,10 @@ def check_margin_sufficient(entry_price, qty, bal, leverage):
     """
     Check if estimated margin requirement fits within available balance.
     Prevents 'insufficient_margin' errors from Delta Exchange.
-    Returns True if margin is sufficient, False otherwise.
     """
     if entry_price <= 0 or qty <= 0 or bal <= 0:
         return False
     estimated_margin = (entry_price * qty) / leverage
-    # Use 90% of balance as safety buffer for fees and maintenance margin
     available_for_margin = bal * 0.9
     if estimated_margin > available_for_margin:
         logger.warning(
@@ -258,7 +359,10 @@ def place_brackets(pid, qty, entry, sl):
     return result
 
 
-# ── Trade management ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRADE MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD):
     entry = bracket["entry"]
     risk = bracket["risk"]
@@ -377,7 +481,7 @@ def execute_trade(pid, symbol, sig, bal):
     if not is_authenticated():
         return None
 
-    # MARGIN CHECK — prevent insufficient_margin errors
+    # MARGIN CHECK
     if not check_margin_sufficient(sig["entry"], sig["quantity"], bal, CONFIG.leverage):
         logger.warning(
             f"{symbol}: skipping trade — insufficient margin for qty={sig['quantity']} "
@@ -396,6 +500,7 @@ def execute_trade(pid, symbol, sig, bal):
         f"SL={sig['stop_loss']:.6f} ({sig.get('sl_method','?')}) | qty={sig['quantity']}"
     )
 
+    # Send signal details to Telegram
     send_telegram(
         f"<b>SIGNAL — MHR_EXHAUSTION SHORT</b>\n"
         f"Symbol: <b>{symbol}</b>\n"
@@ -406,8 +511,14 @@ def execute_trade(pid, symbol, sig, bal):
         f"4 consecutive green candles — pump exhaustion short"
     )
 
+    # TRADE CONFIRMATION — 3 modes:
+    # 1. AUTO_EXECUTE=true → execute immediately
+    # 2. Telegram configured → wait for Telegram reply
+    # 3. No Telegram → fall back to terminal input
     if not AUTO_EXECUTE:
-        if input("Execute? (y/n): ").strip().lower() != "y":
+        confirmed = wait_for_telegram_confirmation(symbol, TELEGRAM_CONFIRM_TIMEOUT)
+        if not confirmed:
+            logger.info(f"{symbol}: trade not confirmed, skipping")
             return None
 
     resp = place_entry(pid, sig["quantity"], sig["entry"])
@@ -440,7 +551,10 @@ def execute_trade(pid, symbol, sig, bal):
     return result
 
 
-# ── Main scan loop ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN SCAN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def run():
     state = load_state()
     today = date.today().isoformat()
@@ -580,7 +694,6 @@ def run():
             )
 
             try:
-                # Pass balance to execute_trade for margin check
                 result = execute_trade(f["product_id"], symbol, sig, bal)
             except Exception as e:
                 err = f"{symbol} execute_trade error: {type(e).__name__}: {e}"
@@ -668,7 +781,8 @@ if __name__ == "__main__":
         "<b>Bot started</b>\n"
         f"Strategy: MHR_EXHAUSTION SHORT\n"
         f"Scan interval: every 1 hour\n"
-        f"Capital cap: ${MAX_LIVE_CAPITAL:.2f} | Liq guard: ${LIQ_GUARD_USD:.2f}"
+        f"Capital cap: ${MAX_LIVE_CAPITAL:.2f} | Liq guard: ${LIQ_GUARD_USD:.2f}\n"
+        f"Trade confirmation: {'Auto' if AUTO_EXECUTE else 'Telegram'}"
     )
     while True:
         try:
