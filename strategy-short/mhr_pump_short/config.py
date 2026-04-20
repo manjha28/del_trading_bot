@@ -35,14 +35,14 @@ class MHRConfig:
 
     # ── Entry thresholds ─────────────────────────────────────────────────
     lookback_green_candles: int = 4
-    min_pump_pct: float = 50.0
+    min_pump_pct: float = 25.0
     lookback_hours: int = 24
     min_volume_surge_pct: float = 2.0
     max_reentries: int = 3
     reentry_cooldown_candles: int = 1
 
     # ── Capital / leverage ───────────────────────────────────────────────
-    capital_deployed: float = 100.0
+    capital_deployed: float = 3.33
     leverage: float = 20.0
     sl_capital_pct: float = 0.05
     pt_capital_pct: float = 1.0
