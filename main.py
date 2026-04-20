@@ -4,10 +4,8 @@ import time
 import json
 import logging
 from datetime import date, datetime, timezone
-
 import requests
 import pandas as pd
-
 from delta_client import client, is_authenticated
 from scanner import get_live_perpetual_futures, get_market_stats
 from strategy_short import (
@@ -30,16 +28,10 @@ MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "6"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
 MIN_BALANCE = float(os.getenv("MIN_BALANCE_TO_TRADE", "10.0"))
 
-# Hard cap on total capital deployed from the live wallet.
-# Exchange auto-liquidates at 50% wallet loss ($5); guard fires at 40% ($4).
 MAX_LIVE_CAPITAL = 10.0
-LIQ_GUARD_USD = MAX_LIVE_CAPITAL * 0.40  # $4.00 — emergency close threshold
+LIQ_GUARD_USD = MAX_LIVE_CAPITAL * 0.40
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-# Set these in .env:
-#   TELEGRAM_BOT_TOKEN=<your bot token from @BotFather>
-#   TELEGRAM_CHAT_ID=<your personal chat id — send any message to your bot,
-#                    then call https://api.telegram.org/bot<TOKEN>/getUpdates>
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -59,7 +51,7 @@ CONFIG = UnifiedShortConfig(
 
 MAX_HOLD = 24
 COOLDOWN_SECONDS = 1 * 3600
-SCAN_INTERVAL = 3600          # 1 hour
+SCAN_INTERVAL = 3600
 MIN_VOLUME_USD = 100_000
 MAX_SPREAD_PCT = 0.5
 STATE_FILE = "trade_state.json"
@@ -67,7 +59,6 @@ BASE_URL = "https://api.india.delta.exchange"
 
 
 # ── Telegram helper ───────────────────────────────────────────────────────────
-
 def send_telegram(msg: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -84,7 +75,6 @@ def send_telegram(msg: str) -> None:
 
 
 # ── State persistence ─────────────────────────────────────────────────────────
-
 def load_state():
     try:
         with open(STATE_FILE) as f:
@@ -95,7 +85,7 @@ def load_state():
             "last_trade_day": "",
             "next_trade_allowed_ts": 0,
             "watching": {},
-            "last_signal_candles": {},   # symbol → last candle timestamp that fired a signal
+            "last_signal_candles": {},
         }
 
 
@@ -105,8 +95,12 @@ def save_state(s):
 
 
 # ── Exchange helpers ──────────────────────────────────────────────────────────
-
 def get_balance(asset="USDT"):
+    """
+    FIX: was def get_balance(asset="USDT","USD") which is invalid Python.
+    Now checks for both "USD" and "USDT" inside the function since
+    Delta Exchange India uses "USD" as the asset symbol [6].
+    """
     if not is_authenticated():
         return 0.0
     try:
@@ -115,8 +109,10 @@ def get_balance(asset="USDT"):
             return 0.0
         for w in d.get("result", []):
             a = w.get("asset_symbol") or w.get("currency") or w.get("asset") or ""
-            if a.upper() == asset.upper():
-                return float(w.get("available_balance") or w.get("balance") or 0)
+            if a.upper() in (asset.upper(), "USD", "USDT"):
+                bal = float(w.get("available_balance") or w.get("balance") or 0)
+                if bal > 0:
+                    return bal
         return 0.0
     except Exception as e:
         logger.error(f"Balance error: {e}")
@@ -244,7 +240,6 @@ def place_brackets(pid, qty, entry, sl):
 
 
 # ── Trade management ──────────────────────────────────────────────────────────
-
 def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD):
     entry = bracket["entry"]
     risk = bracket["risk"]
@@ -268,9 +263,12 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
 
             if size == 0:
                 return {"exit_reason": "CLOSED", "sl_hit": False}
+
             if time.time() >= deadline:
-                if sl_id: cancel(pid, sl_id)
-                if tp_id: cancel(pid, tp_id)
+                if sl_id:
+                    cancel(pid, sl_id)
+                if tp_id:
+                    cancel(pid, tp_id)
                 market_close(pid, int(size))
                 return {"exit_reason": "MAX_HOLD", "sl_hit": False}
 
@@ -287,15 +285,19 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
                     f"50% closed at 2R\n"
                     f"Trailing remainder with SL at breakeven"
                 )
-                if sl_id: cancel(pid, sl_id)
+                if sl_id:
+                    cancel(pid, sl_id)
                 if q2 > 0:
                     resp = place_sl(pid, q2, trail_sl)
                     if resp:
-                        try: sl_id = resp.get("result", {}).get("id")
-                        except: pass
+                        try:
+                            sl_id = resp.get("result", {}).get("id")
+                        except Exception:
+                            pass
 
             if sl_id and sl_id not in live:
-                if tp_id and tp_id in live: cancel(pid, tp_id)
+                if tp_id and tp_id in live:
+                    cancel(pid, tp_id)
                 return {"exit_reason": "TRAIL" if partial_done else "SL_HIT",
                         "sl_hit": not partial_done}
 
@@ -306,7 +308,6 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
                     for t in r.json().get("result", []):
                         if t.get("product_id") == pid:
                             price = float(t.get("mark_price") or t.get("close"))
-
                             unrealized_loss = max(0.0, (price - entry) * size)
                             if unrealized_loss >= liq_guard_usd:
                                 logger.warning(
@@ -319,8 +320,10 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
                                     f"Unrealized loss: ${unrealized_loss:.4f} >= guard ${liq_guard_usd:.2f}\n"
                                     f"Emergency market close sent!"
                                 )
-                                if sl_id: cancel(pid, sl_id)
-                                if tp_id: cancel(pid, tp_id)
+                                if sl_id:
+                                    cancel(pid, sl_id)
+                                if tp_id:
+                                    cancel(pid, tp_id)
                                 market_close(pid, int(size))
                                 return {"exit_reason": "LIQ_GUARD", "sl_hit": False}
 
@@ -331,30 +334,35 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
                                     new_sl = entry - (best_r - 1.0) * risk
                                     if new_sl < trail_sl:
                                         trail_sl = new_sl
-                                        if sl_id: cancel(pid, sl_id)
+                                        if sl_id:
+                                            cancel(pid, sl_id)
                                         remain = q2 if partial_done else bracket["total_qty"]
                                         resp = place_sl(pid, remain, trail_sl)
                                         if resp:
-                                            try: sl_id = resp.get("result", {}).get("id")
-                                            except: pass
+                                            try:
+                                                sl_id = resp.get("result", {}).get("id")
+                                            except Exception:
+                                                pass
                             break
             except Exception:
                 pass
-
         except Exception as e:
             logger.error(f"manage_trailing unexpected error ({symbol}): {e}")
-            send_telegram(f"<b>Trade monitor error</b> — {symbol}\n{type(e).__name__}: {e}\nStill watching position.")
+            send_telegram(
+                f"<b>Trade monitor error</b> — {symbol}\n"
+                f"{type(e).__name__}: {e}\nStill watching position."
+            )
 
 
 def execute_trade(pid, symbol, sig):
     if not is_authenticated():
         return None
+
     logger.info(
         f"{symbol} {sig.get('entry_path', 'UNKNOWN')} SHORT @ {sig['entry']:.6f} | "
         f"SL={sig['stop_loss']:.6f} ({sig.get('sl_method','?')}) | qty={sig['quantity']}"
     )
 
-    # Alert: signal about to be executed
     send_telegram(
         f"<b>SIGNAL — MHR_EXHAUSTION SHORT</b>\n"
         f"Symbol: <b>{symbol}</b>\n"
@@ -373,6 +381,7 @@ def execute_trade(pid, symbol, sig):
     if not resp:
         send_telegram(f"<b>ENTRY FAILED</b> — {symbol}\nOrder placement returned no response.")
         return None
+
     oid = resp.get("result", {}).get("id")
     if not oid or not wait_fill(pid, oid):
         send_telegram(f"<b>ENTRY NOT FILLED</b> — {symbol}\nOrder cancelled after 120s timeout.")
@@ -399,7 +408,6 @@ def execute_trade(pid, symbol, sig):
 
 
 # ── Main scan loop ────────────────────────────────────────────────────────────
-
 def run():
     state = load_state()
     today = date.today().isoformat()
@@ -412,7 +420,8 @@ def run():
     at_max_positions = open_positions() >= MAX_OPEN_TRADES
     at_daily_limit = state["trade_count"] >= MAX_TRADES_PER_DAY
 
-    bal = get_balance("USDT")
+    # FIX: was get_balance("USDT","USD") — invalid syntax
+    bal = get_balance()
     cap = min(calculate_trade_capital(bal, CONFIG), MAX_LIVE_CAPITAL)
 
     can_trade = (
@@ -473,7 +482,6 @@ def run():
             prepared["rsi14"] = calculate_rsi(prepared["close"], 14)
             prepared["atr14"] = calculate_atr(prepared, 14)
 
-            # Duplicate-candle guard: don't re-fire on the same 1h candle we already acted on.
             last_candle_ts = str(prepared.iloc[-1]["time"])
             if last_signal_candles.get(symbol) == last_candle_ts:
                 continue
@@ -487,21 +495,17 @@ def run():
                 prepared, idx, CONFIG,
                 is_reentry=is_reentry, previous_entry_price=prev_entry
             )
-
             if not filter_info:
                 continue
             if filter_info.get("entry_path") != "MHR_EXHAUSTION":
                 continue
 
-            # Mark this candle as seen for this symbol regardless of whether we trade.
             last_signal_candles[symbol] = last_candle_ts
 
             entry_price = float(prepared.iloc[-1]["close"])
             atr = float(prepared.iloc[-1]["atr14"]) if "atr14" in prepared.columns else 0.0
             use_pump_atr = filter_info.get("use_pump_atr", False)
 
-            # Structural SL: SL at prev candle high (no buffer), qty from max loss / sl_dist.
-            # Falls back to ATR if prev_high <= entry_price (gap-up) or qty resolves to 0.
             prev_high = float(prepared.iloc[-2]["high"]) if len(prepared) >= 2 else 0.0
             sl = tp = 0.0
             qty = 0
@@ -537,6 +541,7 @@ def run():
                 "quantity": qty, "trade_capital": cap, "sl_method": sl_method,
                 **filter_info,
             }
+
             logger.info(
                 f"{symbol} | MHR_EXHAUSTION | SL={sl_method} | "
                 f"entry={entry_price:.6f} sl={sl:.6f} qty={qty} cap=${cap:.2f}"
@@ -559,7 +564,10 @@ def run():
                         watching[symbol] = {"reentries": 0}
                     watching[symbol]["reentries"] += 1
                     watching[symbol]["last_entry"] = entry_price
-                    logger.info(f"{symbol}: SL hit — watching ({watching[symbol]['reentries']}/{CONFIG.max_reentries})")
+                    logger.info(
+                        f"{symbol}: SL hit — watching "
+                        f"({watching[symbol]['reentries']}/{CONFIG.max_reentries})"
+                    )
                 else:
                     if symbol in watching:
                         del watching[symbol]
@@ -567,7 +575,9 @@ def run():
                 state["watching"] = watching
                 state["last_signal_candles"] = last_signal_candles
                 save_state(state)
-                bal = get_balance("USDT")
+
+                # FIX: was get_balance("USDT","USD") — invalid syntax
+                bal = get_balance()
                 cap = min(calculate_trade_capital(bal, CONFIG), MAX_LIVE_CAPITAL)
                 can_trade = (
                     state.get("next_trade_allowed_ts", 0) <= int(time.time())
