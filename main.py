@@ -38,7 +38,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ── Strategy config ───────────────────────────────────────────────────────────
 CONFIG = UnifiedShortConfig(
     lookback_green_candles=4,
-    min_pump_pct=50.0,
+    min_pump_pct=25.0,
     capital_deployed=100.0,
     leverage=20.0,
     sl_capital_pct=0.05,
@@ -97,8 +97,7 @@ def save_state(s):
 # ── Exchange helpers ──────────────────────────────────────────────────────────
 def get_balance(asset="USDT"):
     """
-    FIX: was def get_balance(asset="USDT","USD") which is invalid Python.
-    Now checks for both "USD" and "USDT" inside the function since
+    Fetch wallet balance. Checks for both "USD" and "USDT" since
     Delta Exchange India uses "USD" as the asset symbol [6].
     """
     if not is_authenticated():
@@ -144,6 +143,26 @@ def fetch_candles(symbol, resolution="1h", hours=100):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
+
+def check_margin_sufficient(entry_price, qty, bal, leverage):
+    """
+    Check if estimated margin requirement fits within available balance.
+    Prevents 'insufficient_margin' errors from Delta Exchange.
+    Returns True if margin is sufficient, False otherwise.
+    """
+    if entry_price <= 0 or qty <= 0 or bal <= 0:
+        return False
+    estimated_margin = (entry_price * qty) / leverage
+    # Use 90% of balance as safety buffer for fees and maintenance margin
+    available_for_margin = bal * 0.9
+    if estimated_margin > available_for_margin:
+        logger.warning(
+            f"Margin check failed: need ${estimated_margin:.2f}, "
+            f"have ${available_for_margin:.2f} (90% of ${bal:.2f})"
+        )
+        return False
+    return True
 
 
 def place_entry(pid, qty, price):
@@ -354,8 +373,22 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
             )
 
 
-def execute_trade(pid, symbol, sig):
+def execute_trade(pid, symbol, sig, bal):
     if not is_authenticated():
+        return None
+
+    # MARGIN CHECK — prevent insufficient_margin errors
+    if not check_margin_sufficient(sig["entry"], sig["quantity"], bal, CONFIG.leverage):
+        logger.warning(
+            f"{symbol}: skipping trade — insufficient margin for qty={sig['quantity']} "
+            f"@ {sig['entry']:.6f} with balance ${bal:.2f}"
+        )
+        send_telegram(
+            f"<b>SIGNAL SKIPPED</b> — {symbol}\n"
+            f"Reason: Insufficient margin\n"
+            f"Need: ${(sig['entry'] * sig['quantity']) / CONFIG.leverage:.2f}\n"
+            f"Have: ${bal:.2f}"
+        )
         return None
 
     logger.info(
@@ -420,7 +453,6 @@ def run():
     at_max_positions = open_positions() >= MAX_OPEN_TRADES
     at_daily_limit = state["trade_count"] >= MAX_TRADES_PER_DAY
 
-    # FIX: was get_balance("USDT","USD") — invalid syntax
     bal = get_balance()
     cap = min(calculate_trade_capital(bal, CONFIG), MAX_LIVE_CAPITAL)
 
@@ -548,7 +580,8 @@ def run():
             )
 
             try:
-                result = execute_trade(f["product_id"], symbol, sig)
+                # Pass balance to execute_trade for margin check
+                result = execute_trade(f["product_id"], symbol, sig, bal)
             except Exception as e:
                 err = f"{symbol} execute_trade error: {type(e).__name__}: {e}"
                 logger.error(err)
@@ -576,7 +609,6 @@ def run():
                 state["last_signal_candles"] = last_signal_candles
                 save_state(state)
 
-                # FIX: was get_balance("USDT","USD") — invalid syntax
                 bal = get_balance()
                 cap = min(calculate_trade_capital(bal, CONFIG), MAX_LIVE_CAPITAL)
                 can_trade = (
