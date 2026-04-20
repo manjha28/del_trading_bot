@@ -1,11 +1,12 @@
 {
   "trade_count": 0,
-  "last_trade_day": "2026-04-19",
+  "last_trade_day": "2026-04-20",
   "next_trade_allowed_ts": 0,
   "active_trades": [],
   "last_signal_candles": {
-    "VVVUSD": "2026-04-19 11:00:00+00:00",
-    "AIOTUSD": "2026-04-19 11:00:00+00:00"
+    "RIVERUSD": "2026-04-20 18:00:00+00:00",
+    "POLUSD": "2026-04-20 17:00:00+00:00",
+    "BLURUSD": "2026-04-20 18:00:00+00:00"
   },
   "watching": {}
 }
