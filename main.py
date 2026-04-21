@@ -51,8 +51,8 @@ CONFIG = UnifiedShortConfig(
 )
 
 MAX_HOLD = 24
-COOLDOWN_SECONDS = 1 * 3600
-SCAN_INTERVAL = 3600
+COOLDOWN_SECONDS = 5 * 60
+SCAN_INTERVAL = 300
 MIN_VOLUME_USD = 100_000
 MAX_SPREAD_PCT = 0.5
 STATE_FILE = "trade_state.json"
@@ -228,7 +228,7 @@ def check_margin_sufficient(entry_price, qty, bal, leverage):
     if estimated_margin > available_for_margin:
         logger.warning(
             f"Margin check failed: need ${estimated_margin:.2f}, "
-            f"have ${available_for_margin:.2f} (20% of ${bal:.2f})"
+            f"have ${available_for_margin:.2f} (90% of ${bal:.2f})"
         )
         return False
     return True
@@ -360,7 +360,7 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
     partial_done = False
     best_r = 0.0
     trail_sl = bracket["sl"]
-    deadline = entry_ts + MAX_HOLD * 3600
+    deadline = entry_ts + MAX_HOLD * 288
 
     while True:
         time.sleep(60)
@@ -589,7 +589,7 @@ def run():
         lot_size = f.get("lot_size", 1.0)
 
         try:
-            candles = fetch_candles(symbol, "1h", 100)
+            candles = fetch_candles(symbol, "5m", 1200)
             if candles.empty:
                 continue
 
