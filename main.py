@@ -257,28 +257,28 @@ def place_entry(pid, qty, price):
     try:
         d = client.request("POST", "/v2/orders", payload={
             "product_id": pid, "size": qty, "side": "sell",
-            "order_type": "limit_order", "limit_price": str(price),
+            "order_type": "limit_order", "limit_price": str(round(price, 6)),
             "time_in_force": "gtc"}, auth=True).json()
         return d if d.get("success") else None
     except Exception as e:
         logger.error(f"Entry: {e}")
         return None
 
-
 def place_sl(pid, qty, sl):
     try:
         return client.place_stop_order(product_id=pid, size=qty, side="buy",
-                                       order_type="market", stop_price=str(sl))
-    except Exception as e:
-        logger.error(f"SL: {e}")
-        return None
+                                       order_type="market", stop_price=sl)
 
 
 def place_tp(pid, qty, tp):
     try:
+        tp_rounded = round(tp, 6)
+        if tp_rounded <= 0:
+            logger.error(f"TP price invalid: {tp}")
+            return None
         d = client.request("POST", "/v2/orders", payload={
             "product_id": pid, "size": qty, "side": "buy",
-            "order_type": "limit_order", "limit_price": str(tp),
+            "order_type": "limit_order", "limit_price": str(tp_rounded),
             "reduce_only": "true", "time_in_force": "gtc"}, auth=True).json()
         return d if d.get("success") else None
     except Exception as e:
