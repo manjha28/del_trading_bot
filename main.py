@@ -34,7 +34,6 @@ LIQ_GUARD_USD = MAX_LIVE_CAPITAL * 0.40
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-# How long to wait for Telegram confirmation before skipping (seconds)
 TELEGRAM_CONFIRM_TIMEOUT = int(os.getenv("TELEGRAM_CONFIRM_TIMEOUT", "120"))
 
 # ── Strategy config ───────────────────────────────────────────────────────────
@@ -65,7 +64,6 @@ BASE_URL = "https://api.india.delta.exchange"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def send_telegram(msg: str) -> None:
-    """Send a message to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -81,7 +79,6 @@ def send_telegram(msg: str) -> None:
 
 
 def get_telegram_updates(offset: int = 0) -> list:
-    """Fetch new messages from Telegram bot."""
     if not TELEGRAM_BOT_TOKEN:
         return []
     try:
@@ -101,10 +98,6 @@ def get_telegram_updates(offset: int = 0) -> list:
 
 
 def flush_telegram_updates() -> int:
-    """
-    Flush all pending Telegram messages and return the latest update_id + 1.
-    This ensures we only read NEW messages after sending the confirmation request.
-    """
     updates = get_telegram_updates(offset=0)
     if updates:
         return updates[-1]["update_id"] + 1
@@ -112,61 +105,42 @@ def flush_telegram_updates() -> int:
 
 
 def wait_for_telegram_confirmation(symbol: str, timeout: int = 120) -> bool:
-    """
-    Wait for user to reply YES or NO via Telegram.
-    
-    Returns True if user replies with 'y', 'yes', 'go', 'execute'.
-    Returns False if user replies 'n', 'no', 'skip', 'cancel' or timeout.
-    """
+    """Wait for YES/NO reply via Telegram. Falls back to terminal if no Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        # No Telegram configured — fall back to terminal
         try:
             return input("Execute? (y/n): ").strip().lower() in ("y", "yes")
         except EOFError:
             return False
 
-    # Flush old messages so we only read new ones
     offset = flush_telegram_updates()
-
     send_telegram(
         f"<b>⚡ CONFIRM TRADE — {symbol}</b>\n\n"
-        f"Reply with:\n"
-        f"  <b>YES</b> or <b>Y</b> — to execute\n"
-        f"  <b>NO</b> or <b>N</b> — to skip\n\n"
-        f"⏱ Auto-skip in {timeout} seconds if no response."
+        f"Reply <b>YES</b> or <b>NO</b>\n"
+        f"⏱ Auto-skip in {timeout}s"
     )
-
     logger.info(f"Waiting for Telegram confirmation for {symbol} (timeout {timeout}s)...")
 
     start = time.time()
     while time.time() - start < timeout:
         updates = get_telegram_updates(offset=offset)
         for update in updates:
-            # Update offset so we don't process same message twice
             offset = update["update_id"] + 1
-
             msg = update.get("message", {})
             chat_id = str(msg.get("chat", {}).get("id", ""))
             text = (msg.get("text") or "").strip().lower()
-
-            # Only process messages from our chat
             if chat_id != str(TELEGRAM_CHAT_ID):
                 continue
-
             if text in ("y", "yes", "go", "execute", "ok"):
-                send_telegram(f"✅ <b>Trade confirmed</b> — {symbol}\nExecuting now...")
+                send_telegram(f"✅ <b>Trade confirmed</b> — {symbol}")
                 logger.info(f"Telegram confirmation received: YES for {symbol}")
                 return True
-
             if text in ("n", "no", "skip", "cancel", "stop"):
                 send_telegram(f"❌ <b>Trade skipped</b> — {symbol}")
                 logger.info(f"Telegram confirmation received: NO for {symbol}")
                 return False
-
         time.sleep(2)
 
-    # Timeout
-    send_telegram(f"⏰ <b>Trade timed out</b> — {symbol}\nNo response in {timeout}s, skipping.")
+    send_telegram(f"⏰ <b>Timed out</b> — {symbol}\nSkipping.")
     logger.info(f"Telegram confirmation timeout for {symbol}")
     return False
 
@@ -199,10 +173,7 @@ def save_state(s):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_balance(asset="USDT"):
-    """
-    Fetch wallet balance. Checks for both "USD" and "USDT" since
-    Delta Exchange India uses "USD" as the asset symbol [6].
-    """
+    """Fetch wallet balance — checks both USD and USDT."""
     if not is_authenticated():
         return 0.0
     try:
@@ -249,21 +220,37 @@ def fetch_candles(symbol, resolution="1h", hours=100):
 
 
 def check_margin_sufficient(entry_price, qty, bal, leverage):
-    """
-    Check if estimated margin requirement fits within available balance.
-    Prevents 'insufficient_margin' errors from Delta Exchange.
-    """
+    """Conservative margin check — uses 20% of balance as limit."""
     if entry_price <= 0 or qty <= 0 or bal <= 0:
         return False
     estimated_margin = (entry_price * qty) / leverage
-    available_for_margin = bal * 0.60
+    available_for_margin = bal * 0.90
     if estimated_margin > available_for_margin:
         logger.warning(
             f"Margin check failed: need ${estimated_margin:.2f}, "
-            f"have ${available_for_margin:.2f} (90% of ${bal:.2f})"
+            f"have ${available_for_margin:.2f} (20% of ${bal:.2f})"
         )
         return False
     return True
+
+
+def adjust_qty_for_lot_size(qty: int, lot_size: float, symbol: str) -> int:
+    """
+    Convert raw quantity to lots for Delta Exchange.
+
+    Delta Exchange orders are placed in LOTS, not raw units.
+    If lot_size=10, then qty=335 raw units = 33 lots (335 / 10).
+    """
+    if lot_size <= 0:
+        lot_size = 1.0
+
+    if lot_size > 1.0:
+        lots = max(1, int(qty / lot_size))
+        logger.info(f"{symbol}: lot_size={lot_size}, raw_qty={qty}, adjusted_lots={lots}")
+        return lots
+
+    # lot_size == 1 means qty IS already in lots
+    return qty
 
 
 def place_entry(pid, qty, price):
@@ -388,10 +375,8 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
                 return {"exit_reason": "CLOSED", "sl_hit": False}
 
             if time.time() >= deadline:
-                if sl_id:
-                    cancel(pid, sl_id)
-                if tp_id:
-                    cancel(pid, tp_id)
+                if sl_id: cancel(pid, sl_id)
+                if tp_id: cancel(pid, tp_id)
                 market_close(pid, int(size))
                 return {"exit_reason": "MAX_HOLD", "sl_hit": False}
 
@@ -405,22 +390,17 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
                 logger.info(f"{symbol}: 2R partial filled!")
                 send_telegram(
                     f"<b>PARTIAL TP HIT</b> — {symbol}\n"
-                    f"50% closed at 2R\n"
-                    f"Trailing remainder with SL at breakeven"
+                    f"50% closed at 2R\nTrailing remainder"
                 )
-                if sl_id:
-                    cancel(pid, sl_id)
+                if sl_id: cancel(pid, sl_id)
                 if q2 > 0:
                     resp = place_sl(pid, q2, trail_sl)
                     if resp:
-                        try:
-                            sl_id = resp.get("result", {}).get("id")
-                        except Exception:
-                            pass
+                        try: sl_id = resp.get("result", {}).get("id")
+                        except: pass
 
             if sl_id and sl_id not in live:
-                if tp_id and tp_id in live:
-                    cancel(pid, tp_id)
+                if tp_id and tp_id in live: cancel(pid, tp_id)
                 return {"exit_reason": "TRAIL" if partial_done else "SL_HIT",
                         "sl_hit": not partial_done}
 
@@ -433,23 +413,12 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
                             price = float(t.get("mark_price") or t.get("close"))
                             unrealized_loss = max(0.0, (price - entry) * size)
                             if unrealized_loss >= liq_guard_usd:
-                                logger.warning(
-                                    f"LIQUIDATION GUARD {symbol}: loss ${unrealized_loss:.2f} "
-                                    f">= guard ${liq_guard_usd:.2f} — emergency close"
-                                )
-                                send_telegram(
-                                    f"<b>LIQUIDATION GUARD TRIGGERED</b>\n"
-                                    f"Symbol: {symbol}\n"
-                                    f"Unrealized loss: ${unrealized_loss:.4f} >= guard ${liq_guard_usd:.2f}\n"
-                                    f"Emergency market close sent!"
-                                )
-                                if sl_id:
-                                    cancel(pid, sl_id)
-                                if tp_id:
-                                    cancel(pid, tp_id)
+                                logger.warning(f"LIQ GUARD {symbol}: ${unrealized_loss:.2f}")
+                                send_telegram(f"<b>LIQ GUARD</b> — {symbol}\nLoss ${unrealized_loss:.2f}")
+                                if sl_id: cancel(pid, sl_id)
+                                if tp_id: cancel(pid, tp_id)
                                 market_close(pid, int(size))
                                 return {"exit_reason": "LIQ_GUARD", "sl_hit": False}
-
                             if risk > 0:
                                 cur_r = (entry - price) / risk
                                 best_r = max(best_r, cur_r)
@@ -457,86 +426,86 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
                                     new_sl = entry - (best_r - 1.0) * risk
                                     if new_sl < trail_sl:
                                         trail_sl = new_sl
-                                        if sl_id:
-                                            cancel(pid, sl_id)
+                                        if sl_id: cancel(pid, sl_id)
                                         remain = q2 if partial_done else bracket["total_qty"]
                                         resp = place_sl(pid, remain, trail_sl)
                                         if resp:
-                                            try:
-                                                sl_id = resp.get("result", {}).get("id")
-                                            except Exception:
-                                                pass
+                                            try: sl_id = resp.get("result", {}).get("id")
+                                            except: pass
                             break
             except Exception:
                 pass
         except Exception as e:
-            logger.error(f"manage_trailing unexpected error ({symbol}): {e}")
-            send_telegram(
-                f"<b>Trade monitor error</b> — {symbol}\n"
-                f"{type(e).__name__}: {e}\nStill watching position."
-            )
+            logger.error(f"manage_trailing error ({symbol}): {e}")
+            send_telegram(f"<b>Monitor error</b> — {symbol}\n{e}")
 
 
-def execute_trade(pid, symbol, sig, bal):
+def execute_trade(pid, symbol, sig, bal, lot_size):
     if not is_authenticated():
         return None
 
-    # MARGIN CHECK
-    if not check_margin_sufficient(sig["entry"], sig["quantity"], bal, CONFIG.leverage):
+    # ── Adjust quantity for lot size ─────────────────────────────────
+    raw_qty = sig["quantity"]
+    qty_in_lots = adjust_qty_for_lot_size(raw_qty, lot_size, symbol)
+
+    if qty_in_lots <= 0:
+        logger.warning(f"{symbol}: qty_in_lots=0 after lot adjustment (raw={raw_qty}, lot_size={lot_size})")
+        send_telegram(f"<b>SIGNAL SKIPPED</b> — {symbol}\nQty too small after lot size adjustment")
+        return None
+
+    # ── Margin check with lot-adjusted qty ───────────────────────────
+    actual_notional_qty = qty_in_lots * lot_size  # back to units for margin calc
+    if not check_margin_sufficient(sig["entry"], actual_notional_qty, bal, CONFIG.leverage):
         logger.warning(
-            f"{symbol}: skipping trade — insufficient margin for qty={sig['quantity']} "
-            f"@ {sig['entry']:.6f} with balance ${bal:.2f}"
+            f"{symbol}: skipping trade — insufficient margin for "
+            f"{qty_in_lots} lots ({actual_notional_qty} units) @ {sig['entry']:.6f}"
         )
         send_telegram(
             f"<b>SIGNAL SKIPPED</b> — {symbol}\n"
-            f"Reason: Insufficient margin\n"
-            f"Need: ${(sig['entry'] * sig['quantity']) / CONFIG.leverage:.2f}\n"
-            f"Have: ${bal:.2f}"
+            f"Insufficient margin\n"
+            f"Lots: {qty_in_lots} (lot_size={lot_size})\n"
+            f"Balance: ${bal:.2f}"
         )
         return None
 
     logger.info(
-        f"{symbol} {sig.get('entry_path', 'UNKNOWN')} SHORT @ {sig['entry']:.6f} | "
-        f"SL={sig['stop_loss']:.6f} ({sig.get('sl_method','?')}) | qty={sig['quantity']}"
+        f"{symbol} {sig.get('entry_path', '?')} SHORT @ {sig['entry']:.6f} | "
+        f"SL={sig['stop_loss']:.6f} ({sig.get('sl_method','?')}) | "
+        f"raw_qty={raw_qty} → lots={qty_in_lots} (lot_size={lot_size})"
     )
 
-    # Send signal details to Telegram
     send_telegram(
-        f"<b>SIGNAL — MHR_EXHAUSTION SHORT</b>\n"
+        f"<b>SIGNAL — SHORT</b>\n"
         f"Symbol: <b>{symbol}</b>\n"
         f"Entry: {sig['entry']:.6f}\n"
         f"SL: {sig['stop_loss']:.6f} ({sig.get('sl_method', '?')})\n"
         f"TP: {sig['take_profit']:.6f}\n"
-        f"Qty: {sig['quantity']} | Cap: ${sig['trade_capital']:.2f}\n"
-        f"4 consecutive green candles — pump exhaustion short"
+        f"Lots: {qty_in_lots} (lot_size={lot_size}) | Cap: ${sig['trade_capital']:.2f}"
     )
 
-    # TRADE CONFIRMATION — 3 modes:
-    # 1. AUTO_EXECUTE=true → execute immediately
-    # 2. Telegram configured → wait for Telegram reply
-    # 3. No Telegram → fall back to terminal input
     if not AUTO_EXECUTE:
         confirmed = wait_for_telegram_confirmation(symbol, TELEGRAM_CONFIRM_TIMEOUT)
         if not confirmed:
             logger.info(f"{symbol}: trade not confirmed, skipping")
             return None
 
-    resp = place_entry(pid, sig["quantity"], sig["entry"])
+    # ── Place order with lot-adjusted qty ────────────────────────────
+    resp = place_entry(pid, qty_in_lots, sig["entry"])
     if not resp:
-        send_telegram(f"<b>ENTRY FAILED</b> — {symbol}\nOrder placement returned no response.")
+        send_telegram(f"<b>ENTRY FAILED</b> — {symbol}")
         return None
 
     oid = resp.get("result", {}).get("id")
     if not oid or not wait_fill(pid, oid):
-        send_telegram(f"<b>ENTRY NOT FILLED</b> — {symbol}\nOrder cancelled after 120s timeout.")
+        send_telegram(f"<b>NOT FILLED</b> — {symbol}\nCancelled after timeout.")
         return None
 
-    bracket = place_brackets(pid, sig["quantity"], sig["entry"], sig["stop_loss"])
+    # ── Brackets also use lot-adjusted qty ───────────────────────────
+    bracket = place_brackets(pid, qty_in_lots, sig["entry"], sig["stop_loss"])
     send_telegram(
         f"<b>TRADE OPENED</b> — {symbol}\n"
-        f"Entry filled @ {sig['entry']:.6f}\n"
-        f"SL @ {sig['stop_loss']:.6f} | TP @ {bracket['entry'] - 2*bracket['risk']:.6f}\n"
-        f"Qty: {sig['quantity']} | Risk: ${bracket['risk'] * sig['quantity']:.4f}"
+        f"Filled @ {sig['entry']:.6f}\n"
+        f"SL @ {sig['stop_loss']:.6f} | Lots: {qty_in_lots}"
     )
 
     result = manage_trailing(pid, symbol, bracket, time.time())
@@ -588,15 +557,14 @@ def run():
     try:
         futures = get_live_perpetual_futures()
     except Exception as e:
-        msg = f"Failed to fetch futures list: {e}"
-        logger.error(msg)
-        send_telegram(f"<b>Scan error</b>\n{msg}\nWill retry next hour.")
+        logger.error(f"Futures fetch failed: {e}")
+        send_telegram(f"<b>Scan error</b>\n{e}")
         return
 
     try:
         stats = get_market_stats()
     except Exception as e:
-        logger.warning(f"Market stats failed ({e}) — scanning without volume/spread filter")
+        logger.warning(f"Stats failed ({e})")
         stats = {}
 
     filtered = []
@@ -618,6 +586,8 @@ def run():
 
     for f in filtered:
         symbol = f["symbol"]
+        lot_size = f.get("lot_size", 1.0)
+
         try:
             candles = fetch_candles(symbol, "1h", 100)
             if candles.empty:
@@ -690,15 +660,15 @@ def run():
 
             logger.info(
                 f"{symbol} | MHR_EXHAUSTION | SL={sl_method} | "
-                f"entry={entry_price:.6f} sl={sl:.6f} qty={qty} cap=${cap:.2f}"
+                f"entry={entry_price:.6f} sl={sl:.6f} qty={qty} "
+                f"lot_size={lot_size} cap=${cap:.2f}"
             )
 
             try:
-                result = execute_trade(f["product_id"], symbol, sig, bal)
+                result = execute_trade(f["product_id"], symbol, sig, bal, lot_size)
             except Exception as e:
-                err = f"{symbol} execute_trade error: {type(e).__name__}: {e}"
-                logger.error(err)
-                send_telegram(f"<b>Trade execution error</b>\n{err}\nSkipping — bot continues.")
+                logger.error(f"{symbol} execute error: {e}")
+                send_telegram(f"<b>Execution error</b>\n{symbol}: {e}")
                 continue
 
             if result:
@@ -710,10 +680,6 @@ def run():
                         watching[symbol] = {"reentries": 0}
                     watching[symbol]["reentries"] += 1
                     watching[symbol]["last_entry"] = entry_price
-                    logger.info(
-                        f"{symbol}: SL hit — watching "
-                        f"({watching[symbol]['reentries']}/{CONFIG.max_reentries})"
-                    )
                 else:
                     if symbol in watching:
                         del watching[symbol]
@@ -733,30 +699,27 @@ def run():
                 )
 
         except Exception as e:
-            err = f"{symbol} scan error: {type(e).__name__}: {e}"
-            logger.error(err)
-            send_telegram(f"<b>Symbol scan error</b>\n{err}\nSkipping symbol — bot continues.")
+            logger.error(f"{symbol} scan error: {e}")
+            send_telegram(f"<b>Scan error</b>\n{symbol}: {e}")
 
-    # ── Scan complete: send Telegram summary ─────────────────────────────────
+    # ── Scan summary ─────────────────────────────────────────────────
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     status_parts = []
     if cooldown_remaining > 0:
-        status_parts.append(f"Cooldown {cooldown_remaining//60}m remaining")
+        status_parts.append(f"Cooldown {cooldown_remaining // 60}m")
     if at_max_positions:
-        status_parts.append("Max positions open")
+        status_parts.append("Max positions")
     if at_daily_limit:
-        status_parts.append("Daily trade limit reached")
-    status_str = " | ".join(status_parts) if status_parts else "Ready to trade"
+        status_parts.append("Daily limit")
+    status = " | ".join(status_parts) if status_parts else "Ready"
 
-    summary_msg = (
+    send_telegram(
         f"<b>Scan complete</b> — {now_str}\n"
-        f"Scanned: {len(filtered)} symbols\n"
-        f"Signals found: {len(signals_found)}"
+        f"Scanned: {len(filtered)} | Signals: {len(signals_found)}"
         + (f" ({', '.join(signals_found)})" if signals_found else "")
-        + f"\nWallet: ${bal:.2f} | Trades today: {state['trade_count']}/{MAX_TRADES_PER_DAY}\n"
-        f"Status: {status_str}"
+        + f"\nWallet: ${bal:.2f} | Trades: {state['trade_count']}/{MAX_TRADES_PER_DAY}\n"
+        f"Status: {status}"
     )
-    send_telegram(summary_msg)
     logger.info(f"Scan complete — {len(filtered)} symbols, {len(signals_found)} signals: {signals_found}")
 
     # Clean expired watches
@@ -767,8 +730,8 @@ def run():
                 p = c.copy().sort_values("time").reset_index(drop=True)
                 if not is_pump_still_active(p, CONFIG):
                     del watching[sym]
-        except Exception as e:
-            logger.warning(f"Watch cleanup error for {sym}: {e}")
+        except Exception:
+            pass
 
     state["watching"] = watching
     state["last_signal_candles"] = last_signal_candles
@@ -780,19 +743,19 @@ if __name__ == "__main__":
     send_telegram(
         "<b>Bot started</b>\n"
         f"Strategy: MHR_EXHAUSTION SHORT\n"
-        f"Scan interval: every 1 hour\n"
-        f"Capital cap: ${MAX_LIVE_CAPITAL:.2f} | Liq guard: ${LIQ_GUARD_USD:.2f}\n"
-        f"Trade confirmation: {'Auto' if AUTO_EXECUTE else 'Telegram'}"
+        f"Scan: every 1 hour\n"
+        f"Cap: ${MAX_LIVE_CAPITAL:.2f} | Liq guard: ${LIQ_GUARD_USD:.2f}\n"
+        f"Confirm: {'Auto' if AUTO_EXECUTE else 'Telegram'}"
     )
     while True:
         try:
             run()
         except KeyboardInterrupt:
-            send_telegram("<b>Bot stopped</b> — KeyboardInterrupt")
+            send_telegram("<b>Bot stopped</b>")
             break
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
-            send_telegram(f"<b>Bot error</b>\n{type(e).__name__}: {e}")
+            send_telegram(f"<b>Bot error</b>\n{e}")
         sleep_s = SCAN_INTERVAL - (time.time() % SCAN_INTERVAL) + 5
         logger.info(f"Next scan in {sleep_s:.0f}s")
         time.sleep(sleep_s)
