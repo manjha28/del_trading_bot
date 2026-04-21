@@ -51,8 +51,8 @@ CONFIG = UnifiedShortConfig(
 )
 
 MAX_HOLD = 24
-COOLDOWN_SECONDS = 5 * 60
-SCAN_INTERVAL = 300
+COOLDOWN_SECONDS = 1 * 3600
+SCAN_INTERVAL = 3600
 MIN_VOLUME_USD = 100_000
 MAX_SPREAD_PCT = 0.5
 STATE_FILE = "trade_state.json"
@@ -173,7 +173,7 @@ def save_state(s):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_balance(asset="USDT"):
-    """Fetch wallet balance — checks both USD and USDT."""
+    """Fetch wallet balance — checks both USD and USDT [1]."""
     if not is_authenticated():
         return 0.0
     try:
@@ -219,11 +219,12 @@ def fetch_candles(symbol, resolution="1h", hours=100):
     return df
 
 
-def check_margin_sufficient(entry_price, qty, bal, leverage):
-    """Conservative margin check — uses 20% of balance as limit."""
-    if entry_price <= 0 or qty <= 0 or bal <= 0:
+def check_margin_sufficient(entry_price, qty_in_lots, lot_size, bal, leverage):
+    """Conservative margin check using lot-adjusted notional [8]."""
+    if entry_price <= 0 or qty_in_lots <= 0 or bal <= 0:
         return False
-    estimated_margin = (entry_price * qty) / leverage
+    actual_units = qty_in_lots * lot_size
+    estimated_margin = (entry_price * actual_units) / leverage
     available_for_margin = bal * 0.90
     if estimated_margin > available_for_margin:
         logger.warning(
@@ -236,24 +237,22 @@ def check_margin_sufficient(entry_price, qty, bal, leverage):
 
 def adjust_qty_for_lot_size(qty: int, lot_size: float, symbol: str) -> int:
     """
-    Convert raw quantity to lots for Delta Exchange.
+    Convert raw quantity to lots for Delta Exchange [11].
 
-    Delta Exchange orders are placed in LOTS, not raw units.
-    If lot_size=10, then qty=335 raw units = 33 lots (335 / 10).
+    Delta Exchange orders are in LOTS. If lot_size=10,
+    qty=335 raw units = 33 lots (335 / 10).
     """
     if lot_size <= 0:
         lot_size = 1.0
-
     if lot_size > 1.0:
         lots = max(1, int(qty / lot_size))
-        logger.info(f"{symbol}: lot_size={lot_size}, raw_qty={qty}, adjusted_lots={lots}")
+        logger.info(f"{symbol}: lot_size={lot_size}, raw_qty={qty}, lots={lots}")
         return lots
-
-    # lot_size == 1 means qty IS already in lots
     return qty
 
 
 def place_entry(pid, qty, price):
+    """Place limit sell order. Price rounded to 6dp [8]."""
     try:
         d = client.request("POST", "/v2/orders", payload={
             "product_id": pid, "size": qty, "side": "sell",
@@ -264,15 +263,30 @@ def place_entry(pid, qty, price):
         logger.error(f"Entry: {e}")
         return None
 
+
 def place_sl(pid, qty, sl):
+    """Place stop-loss order. Pass numeric stop_price (not string) [8]."""
     try:
-        return client.place_stop_order(product_id=pid, size=qty, side="buy",
-                                       order_type="market", stop_price=sl)
+        sl_rounded = round(float(sl), 6)
+        if sl_rounded <= 0:
+            logger.error(f"SL price invalid: {sl}")
+            return None
+        return client.place_stop_order(
+            product_id=pid,
+            size=qty,
+            side="buy",
+            order_type="market_order",
+            stop_price=str(sl_rounded),
+        )
+    except Exception as e:
+        logger.error(f"SL: {e}")
+        return None
 
 
 def place_tp(pid, qty, tp):
+    """Place take-profit limit order. Price rounded and validated [8] [9]."""
     try:
-        tp_rounded = round(tp, 6)
+        tp_rounded = round(float(tp), 6)
         if tp_rounded <= 0:
             logger.error(f"TP price invalid: {tp}")
             return None
@@ -288,7 +302,8 @@ def place_tp(pid, qty, tp):
 
 def cancel(pid, oid):
     try:
-        client.request("DELETE", f"/v2/orders/{oid}", payload={"product_id": pid}, auth=True)
+        client.request("DELETE", f"/v2/orders/{oid}",
+                        payload={"product_id": pid}, auth=True)
         return True
     except Exception:
         return False
@@ -319,30 +334,35 @@ def wait_fill(pid, oid, timeout=120):
 def open_positions():
     try:
         r = client.request("GET", "/v2/positions/margined", auth=True).json()
-        return len([p for p in r.get("result", []) if abs(float(p.get("size", 0))) > 0])
+        return len([p for p in r.get("result", [])
+                     if abs(float(p.get("size", 0))) > 0])
     except Exception:
         return 0
 
 
 def place_brackets(pid, qty, entry, sl):
+    """Place SL + TP bracket orders using lot-adjusted qty [19]."""
     q1 = qty // 2
     risk = sl - entry
-    tp_2r = entry - 2.0 * risk
+    tp_2r = round(entry - 2.0 * risk, 6)
     result = {"total_qty": qty, "entry": entry, "sl": sl, "risk": risk,
               "q1": q1, "sl_id": None, "tp_id": None}
+
     resp = place_sl(pid, qty, sl)
     if resp:
         try:
             result["sl_id"] = resp.get("result", {}).get("id")
         except Exception:
             pass
-    if q1 > 0:
+
+    if q1 > 0 and tp_2r > 0:
         resp = place_tp(pid, q1, tp_2r)
         if resp:
             try:
                 result["tp_id"] = resp.get("result", {}).get("id")
             except Exception:
                 pass
+
     return result
 
 
@@ -360,7 +380,7 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
     partial_done = False
     best_r = 0.0
     trail_sl = bracket["sl"]
-    deadline = entry_ts + MAX_HOLD * 288
+    deadline = entry_ts + MAX_HOLD * 3600
 
     while True:
         time.sleep(60)
@@ -413,8 +433,13 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
                             price = float(t.get("mark_price") or t.get("close"))
                             unrealized_loss = max(0.0, (price - entry) * size)
                             if unrealized_loss >= liq_guard_usd:
-                                logger.warning(f"LIQ GUARD {symbol}: ${unrealized_loss:.2f}")
-                                send_telegram(f"<b>LIQ GUARD</b> — {symbol}\nLoss ${unrealized_loss:.2f}")
+                                logger.warning(
+                                    f"LIQ GUARD {symbol}: ${unrealized_loss:.2f}"
+                                )
+                                send_telegram(
+                                    f"<b>LIQ GUARD</b> — {symbol}\n"
+                                    f"Loss ${unrealized_loss:.2f}"
+                                )
                                 if sl_id: cancel(pid, sl_id)
                                 if tp_id: cancel(pid, tp_id)
                                 market_close(pid, int(size))
@@ -444,26 +469,21 @@ def execute_trade(pid, symbol, sig, bal, lot_size):
     if not is_authenticated():
         return None
 
-    # ── Adjust quantity for lot size ─────────────────────────────────
+    # ── Adjust quantity for lot size [11] ────────────────────────────
     raw_qty = sig["quantity"]
     qty_in_lots = adjust_qty_for_lot_size(raw_qty, lot_size, symbol)
 
     if qty_in_lots <= 0:
-        logger.warning(f"{symbol}: qty_in_lots=0 after lot adjustment (raw={raw_qty}, lot_size={lot_size})")
-        send_telegram(f"<b>SIGNAL SKIPPED</b> — {symbol}\nQty too small after lot size adjustment")
+        logger.warning(f"{symbol}: qty=0 after lot adjustment (raw={raw_qty}, lot={lot_size})")
+        send_telegram(f"<b>SKIPPED</b> — {symbol}\nQty too small after lot adjustment")
         return None
 
-    # ── Margin check with lot-adjusted qty ───────────────────────────
-    actual_notional_qty = qty_in_lots * lot_size  # back to units for margin calc
-    if not check_margin_sufficient(sig["entry"], actual_notional_qty, bal, CONFIG.leverage):
-        logger.warning(
-            f"{symbol}: skipping trade — insufficient margin for "
-            f"{qty_in_lots} lots ({actual_notional_qty} units) @ {sig['entry']:.6f}"
-        )
+    # ── Margin check with lot-adjusted qty [8] ───────────────────────
+    if not check_margin_sufficient(sig["entry"], qty_in_lots, lot_size, bal, CONFIG.leverage):
         send_telegram(
-            f"<b>SIGNAL SKIPPED</b> — {symbol}\n"
+            f"<b>SKIPPED</b> — {symbol}\n"
             f"Insufficient margin\n"
-            f"Lots: {qty_in_lots} (lot_size={lot_size})\n"
+            f"Lots: {qty_in_lots} (×{lot_size})\n"
             f"Balance: ${bal:.2f}"
         )
         return None
@@ -471,7 +491,7 @@ def execute_trade(pid, symbol, sig, bal, lot_size):
     logger.info(
         f"{symbol} {sig.get('entry_path', '?')} SHORT @ {sig['entry']:.6f} | "
         f"SL={sig['stop_loss']:.6f} ({sig.get('sl_method','?')}) | "
-        f"raw_qty={raw_qty} → lots={qty_in_lots} (lot_size={lot_size})"
+        f"raw={raw_qty} → lots={qty_in_lots} (×{lot_size})"
     )
 
     send_telegram(
@@ -480,16 +500,16 @@ def execute_trade(pid, symbol, sig, bal, lot_size):
         f"Entry: {sig['entry']:.6f}\n"
         f"SL: {sig['stop_loss']:.6f} ({sig.get('sl_method', '?')})\n"
         f"TP: {sig['take_profit']:.6f}\n"
-        f"Lots: {qty_in_lots} (lot_size={lot_size}) | Cap: ${sig['trade_capital']:.2f}"
+        f"Lots: {qty_in_lots} (×{lot_size}) | Cap: ${sig['trade_capital']:.2f}"
     )
 
     if not AUTO_EXECUTE:
         confirmed = wait_for_telegram_confirmation(symbol, TELEGRAM_CONFIRM_TIMEOUT)
         if not confirmed:
-            logger.info(f"{symbol}: trade not confirmed, skipping")
+            logger.info(f"{symbol}: not confirmed, skipping")
             return None
 
-    # ── Place order with lot-adjusted qty ────────────────────────────
+    # ── Place entry with lot-adjusted qty ────────────────────────────
     resp = place_entry(pid, qty_in_lots, sig["entry"])
     if not resp:
         send_telegram(f"<b>ENTRY FAILED</b> — {symbol}")
@@ -500,7 +520,7 @@ def execute_trade(pid, symbol, sig, bal, lot_size):
         send_telegram(f"<b>NOT FILLED</b> — {symbol}\nCancelled after timeout.")
         return None
 
-    # ── Brackets also use lot-adjusted qty ───────────────────────────
+    # ── Brackets with lot-adjusted qty [19] ──────────────────────────
     bracket = place_brackets(pid, qty_in_lots, sig["entry"], sig["stop_loss"])
     send_telegram(
         f"<b>TRADE OPENED</b> — {symbol}\n"
@@ -515,7 +535,7 @@ def execute_trade(pid, symbol, sig, bal, lot_size):
     send_telegram(
         f"<b>TRADE CLOSED</b> — {symbol}\n"
         f"Exit: {exit_reason}\n"
-        f"{'SL hit — watching for reentry' if result.get('sl_hit') else 'Position closed'}"
+        f"{'SL hit — watching' if result.get('sl_hit') else 'Closed'}"
     )
     return result
 
@@ -589,7 +609,7 @@ def run():
         lot_size = f.get("lot_size", 1.0)
 
         try:
-            candles = fetch_candles(symbol, "5m", 1200)
+            candles = fetch_candles(symbol, "1h", 100)
             if candles.empty:
                 continue
 
@@ -603,7 +623,8 @@ def run():
                 continue
 
             watch = watching.get(symbol)
-            is_reentry = watch is not None and watch.get("reentries", 0) < CONFIG.max_reentries
+            is_reentry = (watch is not None
+                          and watch.get("reentries", 0) < CONFIG.max_reentries)
             prev_entry = watch.get("last_entry", 0) if watch else 0
 
             idx = len(prepared) - 1
@@ -619,7 +640,7 @@ def run():
             last_signal_candles[symbol] = last_candle_ts
 
             entry_price = float(prepared.iloc[-1]["close"])
-            atr = float(prepared.iloc[-1]["atr14"]) if "atr14" in prepared.columns else 0.0
+            atr_val = float(prepared.iloc[-1]["atr14"]) if "atr14" in prepared.columns else 0.0
             use_pump_atr = filter_info.get("use_pump_atr", False)
 
             prev_high = float(prepared.iloc[-2]["high"]) if len(prepared) >= 2 else 0.0
@@ -637,12 +658,14 @@ def run():
                         sl = prev_high
                         qty = _qty
                         sl_method = "structural"
-                        _tp_target = max(cap * CONFIG.pt_capital_pct, _max_loss * CONFIG.min_rr)
+                        _tp_target = max(cap * CONFIG.pt_capital_pct,
+                                         _max_loss * CONFIG.min_rr)
                         tp = entry_price - _tp_target / qty
 
             if sl_method == "atr":
                 try:
-                    sl, tp, qty = calculate_sl_tp_prices(entry_price, CONFIG, cap, atr, use_pump_atr)
+                    sl, tp, qty = calculate_sl_tp_prices(
+                        entry_price, CONFIG, cap, atr_val, use_pump_atr)
                 except ValueError:
                     continue
 
@@ -720,9 +743,12 @@ def run():
         + f"\nWallet: ${bal:.2f} | Trades: {state['trade_count']}/{MAX_TRADES_PER_DAY}\n"
         f"Status: {status}"
     )
-    logger.info(f"Scan complete — {len(filtered)} symbols, {len(signals_found)} signals: {signals_found}")
+    logger.info(
+        f"Scan complete — {len(filtered)} symbols, "
+        f"{len(signals_found)} signals: {signals_found}"
+    )
 
-    # Clean expired watches
+    # Clean expired watches [13]
     for sym in list(watching.keys()):
         try:
             c = fetch_candles(sym, "1h", 30)
