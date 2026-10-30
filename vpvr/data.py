@@ -45,6 +45,16 @@ class DeltaMarketData:
     def fetch_tickers(self):
         return self._get_json("/v2/tickers").get("result", [])
 
+    def fetch_orderbook(self, symbol: str, depth: int = 5):
+        """Fetch public L2 book. Delta returns result.buy/result.sell price-size levels."""
+        if not symbol or not 1 <= int(depth) <= 100:
+            raise ValueError("symbol is required and order-book depth must be 1..100")
+        payload = self._get_json(f"/v2/l2orderbook/{symbol}", {"depth": int(depth)})
+        book = payload.get("result")
+        if not isinstance(book, dict) or not isinstance(book.get("buy"), list) or not isinstance(book.get("sell"), list):
+            raise MarketDataError("Delta order-book response is missing buy/sell levels")
+        return book
+
     def fetch_public_trades(self, symbol):
         """Return actual Delta aggressor-side trades for CVD and trade-level VP."""
         result = self._get_json(f"/v2/trades/{symbol}").get("result", {})
@@ -166,10 +176,17 @@ class DeltaMarketData:
             return None
         if product.get("trading_status") not in (None, "operational"):
             return None
+        lot_increment_verified = product.get("lot_size") is not None
+        minimum_verified = (product.get("minimum_order_size") is not None or
+                            product.get("min_order_size") is not None)
         return {
             "contract_multiplier": multiplier, "tick_size": tick,
             "lot_size": lot, "min_qty": minimum,
-            "spec_verified": bool(product.get("minimum_order_size") or
-                                  product.get("min_order_size") or product.get("lot_size")),
-            "position_size_limit": number("position_size_limit")
+            "spec_verified": bool(lot_increment_verified and minimum_verified),
+            "lot_increment_verified": lot_increment_verified,
+            "minimum_quantity_verified": minimum_verified,
+            "position_size_limit": number("position_size_limit"),
+            "sizing_assumption": None if lot_increment_verified and minimum_verified else
+                "Delta public product metadata does not publish all lot/minimum fields; "
+                "paper sizing uses a 1-contract step/minimum assumption."
         }
