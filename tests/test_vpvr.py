@@ -356,6 +356,7 @@ class DataTests(unittest.TestCase):
         )
         self.assertFalse(specs["spec_verified"])
         self.assertIn("contract_value_does_not_match_published_symbol_policy", specs["verification_errors"])
+        self.assertFalse(specs["minimum_quantity_verified"])
 
     def test_wrong_underlying_currency_remains_unverified(self):
         specs = DeltaMarketData(config=VPVRConfig()).contract_specs(
