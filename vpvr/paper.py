@@ -154,7 +154,9 @@ class PaperBroker:
             if stop_hit:
                 fill = position["stop"] * (1 - self.slippage_bps / 10000 if direction == "LONG"
                                            else 1 + self.slippage_bps / 10000)
-                self._close(symbol, fill, "STOP_OR_TRAIL", timestamp, events)
+                stop_reason = ("TRAIL_STOP" if position["target_index"] >= 2 else
+                               "BREAKEVEN_STOP" if position["target_index"] >= 1 else "STOP")
+                self._close(symbol, fill, stop_reason, timestamp, events)
                 self._save()
                 return events
 
