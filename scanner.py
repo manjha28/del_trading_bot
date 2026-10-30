@@ -11,6 +11,12 @@ def get_live_perpetual_futures(base_url: str = DEFAULT_BASE_URL) -> list[dict]:
     """
     Fetch live perpetual futures from PUBLIC endpoint.
     No authentication needed.
+
+    Returns list of dicts with keys:
+        symbol      — trading pair name (e.g. "BTCUSD")
+        product_id  — numeric ID used for order placement
+        lot_size    — contract_value / minimum order unit
+                      (e.g. 10 means 1 lot = 10 units)
     """
     try:
         with requests.Session() as session:
@@ -32,12 +38,30 @@ def get_live_perpetual_futures(base_url: str = DEFAULT_BASE_URL) -> list[dict]:
         logger.error("Non-JSON response from products endpoint")
         return []
 
-    futures = [
-        {"symbol": p["symbol"], "product_id": p["id"]}
-        for p in products
-        if p.get("contract_type") == "perpetual_futures"
-        and p.get("state") == "live"
-    ]
+    futures = []
+    for p in products:
+        if p.get("contract_type") != "perpetual_futures":
+            continue
+        if p.get("state") != "live":
+            continue
+
+        # Extract lot size from contract_value, contract_size, or lot_size fields
+        lot_size = 1.0
+        for field in ("contract_value", "contract_size", "lot_size"):
+            val = p.get(field)
+            if val is not None:
+                try:
+                    lot_size = float(val)
+                    if lot_size > 0:
+                        break
+                except (TypeError, ValueError):
+                    continue
+
+        futures.append({
+            "symbol": p["symbol"],
+            "product_id": p["id"],
+            "lot_size": lot_size,
+        })
 
     logger.info(f"Live perpetual futures fetched: {len(futures)}")
     return futures
@@ -104,4 +128,4 @@ if __name__ == "__main__":
     futures = get_live_perpetual_futures()
     print(f"Perpetual Futures Found: {len(futures)}")
     for f in futures:
-        print(f)
+        print(f"  {f['symbol']} | id={f['product_id']} | lot_size={f['lot_size']}")
