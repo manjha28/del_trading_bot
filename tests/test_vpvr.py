@@ -101,6 +101,20 @@ class RiskTests(unittest.TestCase):
         self.assertFalse(too_small.accepted)
         self.assertIn("below exchange minimum",too_small.reason)
 
+
+    def test_btc_contract_multiplier_sizes_integer_order_contracts(self):
+        engine = RiskEngine(self.cfg)
+        engine.reset_day(1000, date(2026, 1, 1))
+        decision = engine.size(
+            equity=1000, entry=80000, stop=79000, direction="LONG",
+            leverage=10, contract_multiplier=0.001, lot_size=1, min_qty=1,
+            tick_size=0.5, fee_rate=0.0005, slippage_bps=2, max_qty=125000,
+        )
+        self.assertTrue(decision.accepted, decision.reason)
+        self.assertEqual(decision.quantity, 4)
+        self.assertIsInstance(decision.quantity, int)
+        self.assertEqual(decision.notional, 320.0)
+
     def test_exchange_position_size_limit_caps_quantity(self):
         engine=RiskEngine(self.cfg);engine.reset_day(1000,date(2026,1,1))
         decision=engine.size(equity=1000,entry=100,stop=99,direction="LONG",
