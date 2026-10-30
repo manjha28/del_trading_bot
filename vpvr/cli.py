@@ -13,10 +13,8 @@ from pathlib import Path
 import pandas as pd
 from .config import VPVRConfig
 from .data import DeltaMarketData, MarketDataError
-from .indicators import cumulative_volume_delta, trade_delta_bars, delta_divergence
-from .profile import build_volume_profile, rolling_profiles
-from .regime import classify_regime
-from .strategies import generate_signals
+from .profile import build_volume_profile
+from .engine import VPVREngine
 from .risk import RiskEngine
 from .paper import PaperBroker
 from .backtest import run_backtest, BacktestConfig
@@ -112,9 +110,18 @@ def scan_once(symbols, paper=False, config=None):
                 output.append({"symbol":symbol,"status":"no_trade_spread_unavailable_or_too_wide",
                     "bid":bid,"ask":ask,"spread_pct":spread,"max_spread_pct":cfg.max_spread_pct})
                 continue
-            funding=ticker.get("funding_rate")
-            try: funding=float(funding) if funding is not None else None
-            except (TypeError,ValueError): funding=None
+            # Funding is an entry filter only. We require a fresh public FUNDING
+            # candle; unavailable/stale funding is a no-trade condition.
+            try:
+                funding=data.fetch_current_funding_rate(symbol)
+            except MarketDataError as exc:
+                output.append({"symbol":symbol,"status":"no_trade_funding_rate_unavailable",
+                    "reason":str(exc)})
+                continue
+            if abs(funding)>cfg.max_abs_funding_rate:
+                output.append({"symbol":symbol,"status":"no_trade_funding_rate_exceeded",
+                    "funding_rate":funding,"max_abs_funding_rate":cfg.max_abs_funding_rate})
+                continue
 
             # Process fresh, unique completed 1m bars and reconcile any closes into risk state.
             trade_count_before=len(broker.state["trades"])
@@ -137,35 +144,21 @@ def scan_once(symbols, paper=False, config=None):
             equity=broker.equity(marks)
             risk.update_equity(equity,today)
 
-            profile_frame=frames["15m"].tail(cfg.profile_lookback_15m)
-            profile_start=pd.Timestamp(profile_frame.time.iloc[0])
-            profile_end=pd.Timestamp(profile_frame.time.iloc[-1])+pd.Timedelta(minutes=15)
-            # True trade-level VP is used only when the REST tape covers the entire
-            # requested profile window. Otherwise use a prominently labeled OHLCV estimate.
+            # Pure analysis orchestrator owns the profile/regime/strategy pipeline.
             try:
                 trades=data.fetch_public_trades(symbol)
             except MarketDataError:
                 trades=pd.DataFrame(columns=["time","price","volume","side"])
-            tape_covers_window=(not trades.empty and trades.time.min()<=profile_start and
-                                trades.time.max()>=profile_end-pd.Timedelta(minutes=1))
-            if tape_covers_window:
-                profile=build_volume_profile(trades=trades.loc[(trades.time>=profile_start)&(trades.time<profile_end)],
-                    rows=cfg.profile_rows,value_area_pct=cfg.value_area_pct,
-                    smoothing_window=cfg.node_smoothing_window,node_threshold_pct=cfg.node_threshold_pct)
-            else:
-                profile=build_volume_profile(profile_frame,rows=cfg.profile_rows,
-                    value_area_pct=cfg.value_area_pct,smoothing_window=cfg.node_smoothing_window,
-                    node_threshold_pct=cfg.node_threshold_pct)
-            profile_history=rolling_profiles(frames["15m"].tail(96),rows=cfg.profile_rows,
-                value_area_pct=cfg.value_area_pct,window=32,step=16,
-                smoothing_window=cfg.node_smoothing_window,node_threshold_pct=cfg.node_threshold_pct)
-            regime=classify_regime(frames["15m"],frames["3m"],profile,profile_history)
-            signals=generate_signals(symbol,frames["1m"],frames["3m"],frames["15m"],
-                profile,regime,cfg.min_reward_risk,cfg.min_volume_multiple)
-
-            cvd=cumulative_volume_delta(trades)
-            delta_bars=trade_delta_bars(trades,"1min")
-            divergence=delta_divergence(frames["1m"].tail(10),delta_bars.tail(10),lookback=10)
+            analysis=VPVREngine(cfg).analyse(
+                symbol,frames["1m"],frames["3m"],frames["15m"],trades
+            )
+            profile=analysis.profile
+            regime=analysis.regime
+            signals=list(analysis.signals)
+            diagnostics=analysis.diagnostics
+            tape_covers_window=bool(diagnostics["trade_tape_covers_profile_window"])
+            cvd=diagnostics["cvd"]
+            divergence=diagnostics["delta_divergence"]
             specs=data.contract_specs(product)
             if specs is None:
                 output.append({"symbol":symbol,"status":"contract_metadata_incomplete",
@@ -174,6 +167,17 @@ def scan_once(symbols, paper=False, config=None):
                 continue
 
             signal_rows=[]
+            if not specs["spec_verified"]:
+                for signal in signals:
+                    signal_rows.append({"signal":signal.as_dict(),
+                        "status":"paper_blocked_unverified_contract_size" if paper else
+                                 "signal_only_contract_size_unverified",
+                        "reason":"Quantity is not computed without a confirmed exchange lot increment and minimum order quantity."})
+                output.append({"symbol":symbol,"status":"contract_size_unverified",
+                    "profile":profile.as_dict(),"regime":regime.regime.value,
+                    "indicators":diagnostics,"spread_pct":spread,"funding_rate":funding,
+                    "contract_specs":specs,"paper_events":paper_events,"signals":signal_rows})
+                continue
             for signal in signals:
                 if paper and (len(broker.state["positions"])+len(broker.state["pending"]))>=cfg.max_positions:
                     signal_rows.append({"signal":signal.as_dict(),"status":"max_positions_reached"})
@@ -201,8 +205,8 @@ def scan_once(symbols, paper=False, config=None):
             output.append({"symbol":symbol,"status":"ok",
                 "regime":{"name":regime.regime.value,"confidence":regime.confidence,"reasons":regime.reasons},
                 "profile":profile.as_dict(),"spread_pct":spread,"funding_rate_quote":funding,
-                "funding_model_status":"rate quote only; no timestamped settlement event supplied, so no funding cash flow was fabricated",
-                "cvd":cvd,"delta_divergence":divergence,
+                "funding_model_status":"fresh public funding rate used as entry filter; no timestamped settlement event supplied, so no funding cash flow was fabricated",
+                "indicators":diagnostics,"cvd":cvd,"delta_divergence":divergence,
                 "trade_tape_covers_profile_window":tape_covers_window,
                 "contract_specs":specs,"paper_events":paper_events,"signals":signal_rows})
         except (MarketDataError,ValueError,KeyError) as exc:
@@ -240,6 +244,10 @@ def main(argv=None):
     bt.add_argument("--csv-1m",required=True);bt.add_argument("--csv-3m",required=True);bt.add_argument("--csv-15m",required=True)
     bt.add_argument("--initial-balance",type=float,default=1000)
     bt.add_argument("--contract-multiplier",type=float,default=1.0)
+    bt.add_argument("--lot-size",type=float,default=1.0)
+    bt.add_argument("--min-qty",type=float,default=1.0)
+    bt.add_argument("--tick-size",type=float,default=None)
+    bt.add_argument("--position-size-limit",type=float,default=None)
     bt.add_argument("--output",default="vpvr_backtest.json")
     args=parser.parse_args(argv)
     cfg=VPVRConfig.from_env()
@@ -286,8 +294,12 @@ def main(argv=None):
                 value_area_pct=cfg.value_area_pct,min_reward_risk=cfg.min_reward_risk,
                 volume_multiple=cfg.min_volume_multiple,fee_rate=cfg.fee_rate,
                 slippage_bps=cfg.slippage_bps,leverage=cfg.default_leverage,
-                risk_per_trade_pct=cfg.risk_per_trade_pct),
-            contract_multiplier=args.contract_multiplier)
+                risk_per_trade_pct=cfg.risk_per_trade_pct,
+                trailing_buffer_pct=cfg.stop_buffer_pct,
+                max_hold_minutes=cfg.max_hold_minutes),
+            contract_multiplier=args.contract_multiplier,lot_size=args.lot_size,
+            min_qty=args.min_qty,tick_size=args.tick_size,
+            position_size_limit=args.position_size_limit)
         Path(args.output).parent.mkdir(parents=True,exist_ok=True)
         Path(args.output).write_text(json.dumps(result,indent=2,default=str),encoding="utf-8")
         print(json.dumps(result["metrics"],indent=2));print(f"Detailed report: {args.output}");return 0
