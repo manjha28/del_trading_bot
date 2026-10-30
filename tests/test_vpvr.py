@@ -117,9 +117,11 @@ class RiskTests(unittest.TestCase):
     def test_tick_rounding_never_moves_stop_toward_entry(self):
         engine=RiskEngine(self.cfg);engine.reset_day(1000,date(2026,1,1))
         long=engine.size(equity=1000,entry=100,stop=99.16,direction="LONG",
-            leverage=10,contract_multiplier=1,lot_size=1,min_qty=1,tick_size=0.1)
+            leverage=10,contract_multiplier=1,lot_size=1,min_qty=1,tick_size=0.1,
+            fee_rate=.0005,slippage_bps=2)
         short=engine.size(equity=1000,entry=100,stop=100.84,direction="SHORT",
-            leverage=10,contract_multiplier=1,lot_size=1,min_qty=1,tick_size=0.1)
+            leverage=10,contract_multiplier=1,lot_size=1,min_qty=1,tick_size=0.1,
+            fee_rate=.0005,slippage_bps=2)
         self.assertTrue(long.accepted,long.reason)
         self.assertTrue(short.accepted,short.reason)
         self.assertEqual(long.quantity,4)
