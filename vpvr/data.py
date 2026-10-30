@@ -69,6 +69,38 @@ class DeltaMarketData:
         return frame.sort_values("time").drop_duplicates(
             ["time", "price", "volume", "side"]).reset_index(drop=True)
 
+    def fetch_funding_history(self, symbol, start_ts, end_ts, resolution="1h"):
+        """Fetch public historical funding candles using Delta's FUNDING:<symbol> syntax."""
+        if resolution not in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"):
+            raise ValueError("unsupported funding history resolution")
+        if int(end_ts) <= int(start_ts):
+            raise ValueError("funding history end must be greater than start")
+        payload = self._get_json("/v2/history/candles", {
+            "symbol": f"FUNDING:{symbol}", "resolution": resolution,
+            "start": int(start_ts), "end": int(end_ts)
+        })
+        frame = pd.DataFrame(payload.get("result", []))
+        if frame.empty:
+            raise MarketDataError(f"funding history unavailable for {symbol}")
+        if not {"time", "close"}.issubset(frame.columns):
+            raise MarketDataError("funding candle response has no time/close fields")
+        frame["time"] = pd.to_datetime(frame.time, unit="s", utc=True, errors="coerce")
+        frame["funding_rate"] = pd.to_numeric(frame.close, errors="coerce")
+        frame = frame.dropna(subset=["time", "funding_rate"]).sort_values("time")
+        if frame.empty:
+            raise MarketDataError(f"funding history contains no valid values for {symbol}")
+        return frame[["time", "funding_rate"]].drop_duplicates("time").reset_index(drop=True)
+
+    def fetch_current_funding_rate(self, symbol, now=None, max_age_seconds=9 * 3600):
+        """Return last public funding rate only when recent enough to support the filter."""
+        end = int(now or time.time())
+        history = self.fetch_funding_history(symbol, end - 7 * 86400, end, resolution="1h")
+        latest = history.iloc[-1]
+        age = end - pd.Timestamp(latest.time).timestamp()
+        if age < -1 or age > max_age_seconds:
+            raise MarketDataError(f"funding rate is stale for {symbol} ({age:.0f}s old)")
+        return float(latest.funding_rate)
+
     def _fetch_candle_chunk(self, symbol, timeframe, start_ts, end_ts):
         payload = self._get_json("/v2/history/candles", {
             "symbol": symbol, "resolution": timeframe,
@@ -166,7 +198,7 @@ class DeltaMarketData:
             return None
         if multiplier is None or tick is None:
             return None
-        if product.get("trading_status") not in (None, "operational"):
+        if product.get("trading_status") != "operational":
             return None
         return {
             "contract_multiplier": multiplier, "tick_size": tick,
