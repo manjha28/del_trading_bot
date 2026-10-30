@@ -100,6 +100,14 @@ class RiskTests(unittest.TestCase):
         self.assertFalse(too_small.accepted)
         self.assertIn("below exchange minimum",too_small.reason)
 
+    def test_exchange_position_size_limit_caps_quantity(self):
+        engine=RiskEngine(self.cfg);engine.reset_day(1000,date(2026,1,1))
+        decision=engine.size(equity=1000,entry=100,stop=99,direction="LONG",
+            leverage=10,contract_multiplier=1,lot_size=1,min_qty=1,tick_size=.01,
+            fee_rate=.0005,slippage_bps=2,max_qty=2)
+        self.assertTrue(decision.accepted,decision.reason)
+        self.assertEqual(decision.quantity,2)
+
     def test_consecutive_loss_lockout_persists_across_day(self):
         engine=RiskEngine(self.cfg);engine.reset_day(1000,date(2026,1,1))
         engine.record_close(-1);engine.record_close(-1);engine.record_close(-1)
