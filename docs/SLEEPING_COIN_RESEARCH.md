@@ -18,6 +18,25 @@ persists observations in `data/sleeping_coin_research.sqlite3` and writes
 explicitly. Per-symbol data failures remain visible in the catalog and reduce
 confidence; they do not remove a product from discovery.
 
+Start the basic local frontend separately:
+
+```bash
+.venv/bin/python -m coin_research.server \
+  --db data/sleeping_coin_research.sqlite3 \
+  --host 127.0.0.1 --port 8765
+```
+
+Open `http://127.0.0.1:8765`. The server is read-only and binds to loopback
+addresses only. It exposes `/api/summary`, `/api/products`, individual
+`/api/products/<symbol>` detail, cached candle, event, and outcome endpoints.
+It requires the scan command to have created/populated the database; it never
+fetches market data itself. The frontend refresh button re-reads the database,
+so keep a scan loop running separately if you want frequent updates.
+
+The catalog is paginated and searchable. Selecting a symbol reveals complete
+exchange metadata, the latest full observation, recent observation history,
+events/rejections, matured outcomes, and cached 1h/5m/1m candles.
+
 Use `--loop-seconds 300` to repeat full-universe scans. `--db`, `--dashboard`,
 `--base-url`, `--request-interval`, `--execution-notional`,
 `--max-spread-pct`, and `--max-impact-pct` override defaults. Execution

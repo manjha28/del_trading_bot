@@ -3,7 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer
+import json
+import sqlite3
 from pathlib import Path
+from threading import Thread
+from urllib.request import urlopen
 
 import numpy as np
 import pandas as pd
@@ -13,6 +18,7 @@ from coin_research.dashboard import build_dashboard
 from coin_research.cli import scan_once
 from coin_research.features import _percentile, evaluate_symbol
 from coin_research.market import DeltaResearchData
+from coin_research.server import create_handler
 from coin_research.store import ResearchStore
 
 
@@ -206,6 +212,44 @@ class StoreTests(unittest.TestCase):
                           dashboard.read_text(encoding="utf-8"))
             self.assertIn("out-of-sample", dashboard.read_text(encoding="utf-8"))
             store.close()
+
+    def test_api_exposes_catalog_detail_events_and_is_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.sqlite3"
+            with ResearchStore(path) as store:
+                store.reconcile_products([{
+                    "id": 8, "symbol": "VISIBLEUSD", "contract_type": "perpetual_futures",
+                    "state": "live", "tick_size": 0.1,
+                }], "2026-01-01T00:00:00+00:00")
+                store.record_observation("8", {
+                    "as_of": "2026-01-01T00:00:00+00:00", "state": "sleeping",
+                    "sleeping_score": 90, "features": {"atr_14h_pct": 1.2},
+                    "market": {"spread_pct": 0.3}, "execution": {
+                        "eligible": False, "reasons": ["spread too wide"],
+                    }, "data_quality": {"confidence": 0.75, "issues": []},
+                    "signals": [],
+                })
+            server = ThreadingHTTPServer(("127.0.0.1", 0), create_handler(path))
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                with urlopen(f"{base}/api/products?state=sleeping") as response:
+                    products = json.loads(response.read())
+                self.assertEqual(products["total"], 1)
+                self.assertEqual(products["items"][0]["symbol"], "VISIBLEUSD")
+                with urlopen(f"{base}/api/products/VISIBLEUSD") as response:
+                    detail = json.loads(response.read())
+                self.assertEqual(detail["observations"][0]["observation"]["features"]["atr_14h_pct"], 1.2)
+                with urlopen(f"{base}/") as response:
+                    self.assertIn(b"Complete perpetual catalog", response.read())
+                with self.assertRaises(sqlite3.OperationalError):
+                    with ResearchStore(path, read_only=True) as readonly:
+                        readonly.connection.execute("DELETE FROM products")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 class DiscoveryTests(unittest.TestCase):

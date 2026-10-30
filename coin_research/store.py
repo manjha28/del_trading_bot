@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 def _json(value: Any) -> str:
@@ -14,13 +15,28 @@ def _json(value: Any) -> str:
 class ResearchStore:
     """Persistent catalog, candle history, observations, and shadow event log."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, read_only: bool = False):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.path)
+        if read_only:
+            if not self.path.is_file():
+                raise FileNotFoundError(f"research database does not exist: {self.path}")
+            uri = f"file:{quote(str(self.path.resolve()))}?mode=ro"
+            self.connection = sqlite3.connect(uri, uri=True, timeout=10)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.connection = sqlite3.connect(self.path, timeout=10)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
-        self._initialize()
+        if read_only:
+            self.connection.execute("PRAGMA query_only = ON")
+        else:
+            self._initialize()
+
+    def __enter__(self) -> "ResearchStore":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
     def _initialize(self) -> None:
         self.connection.executescript("""
@@ -272,6 +288,216 @@ class ResearchStore:
         """).fetchall()
         return [dict(row) | {"observation": json.loads(row["data_json"])
                              if row["data_json"] else None} for row in rows]
+
+    def list_products(
+        self,
+        search: str = "",
+        state: str = "",
+        execution: str = "",
+        sort: str = "symbol",
+        descending: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        rows = self.latest_observations()
+        query = search.casefold().strip()
+        selected = []
+        for row in rows:
+            observation = row["observation"] or {}
+            product_state = row["product_state"]
+            research_state = observation.get("state")
+            displayed_state = (
+                "not_returned" if product_state == "not_returned"
+                else research_state if product_state == "live"
+                else "not_live"
+            )
+            execution_eligible = observation.get("execution", {}).get("eligible")
+            if query and query not in row["symbol"].casefold():
+                continue
+            if state and state not in (displayed_state, product_state):
+                continue
+            if execution == "eligible" and execution_eligible is not True:
+                continue
+            if execution == "ineligible" and execution_eligible is not False:
+                continue
+            selected.append({
+                "product_id": row["product_id"],
+                "symbol": row["symbol"],
+                "product_state": product_state,
+                "state": displayed_state,
+                "sleeping_score": observation.get("sleeping_score"),
+                "data_confidence": observation.get("data_quality", {}).get("confidence"),
+                "execution_eligible": execution_eligible,
+                "as_of": observation.get("as_of", row.get("run_at")),
+                "notional_24h": (
+                    observation.get("features", {}).get("notional_24h_ticker")
+                    or observation.get("features", {}).get("notional_24h_candle_estimate")
+                ),
+                "volume_ratio_30d": observation.get("features", {}).get("volume_ratio_30d"),
+                "realized_volatility_1h_annualized_pct": observation.get(
+                    "features", {}
+                ).get("realized_volatility_1h_annualized_pct"),
+                "atr_14h_pct": observation.get("features", {}).get("atr_14h_pct"),
+                "spread_pct": observation.get("market", {}).get("spread_pct"),
+                "bid_depth_usd_5": observation.get("market", {}).get("bid_depth_usd_5"),
+                "ask_depth_usd_5": observation.get("market", {}).get("ask_depth_usd_5"),
+                "hourly_data_age_seconds": observation.get(
+                    "data_quality", {}
+                ).get("hourly_age_seconds"),
+            })
+        sort_keys = {
+            "symbol": lambda item: item["symbol"].casefold(),
+            "state": lambda item: item["state"] or "",
+            "sleeping_score": lambda item: (
+                item["sleeping_score"] is None,
+                item["sleeping_score"] if item["sleeping_score"] is not None else -1,
+            ),
+            "data_confidence": lambda item: (
+                item["data_confidence"] is None,
+                item["data_confidence"] if item["data_confidence"] is not None else -1,
+            ),
+        }
+        selected.sort(key=sort_keys.get(sort, sort_keys["symbol"]), reverse=descending)
+        total = len(selected)
+        return {
+            "items": selected[offset:offset + limit],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def product_detail(self, symbol: str, history_limit: int = 100) -> dict | None:
+        product = self.connection.execute("""
+            SELECT product_id,symbol,state,contract_type,first_seen,last_seen,last_reconciled,
+                   metadata_json
+            FROM products WHERE symbol=? ORDER BY last_reconciled DESC LIMIT 1
+        """, (symbol,)).fetchone()
+        if product is None:
+            return None
+        product = dict(product)
+        product["metadata"] = json.loads(product.pop("metadata_json"))
+        product_id = product["product_id"]
+        history = self.connection.execute("""
+            SELECT run_at,state,sleeping_score,confidence,data_json FROM observations
+            WHERE product_id=? ORDER BY run_at DESC,id DESC LIMIT ?
+        """, (product_id, history_limit)).fetchall()
+        product["observations"] = [
+            dict(row) | {"observation": json.loads(row["data_json"])}
+            for row in history
+        ]
+        product["events"] = self.list_events(product_id=product_id, limit=100)["items"]
+        product["outcomes"] = self.list_outcomes(product_id=product_id, limit=100)["items"]
+        return product
+
+    def summary(self) -> dict:
+        product_states = {
+            row["state"]: row["count"] for row in self.connection.execute(
+                "SELECT state,COUNT(*) AS count FROM products GROUP BY state"
+            )
+        }
+        latest = self.connection.execute(
+            "SELECT MAX(run_at) AS latest_observation FROM observations"
+        ).fetchone()["latest_observation"]
+        outcome = self.connection.execute("""
+            SELECT COUNT(*) AS matured,
+                   SUM(CASE WHEN net_return_pct IS NOT NULL THEN 1 ELSE 0 END) AS with_costs,
+                   AVG(gross_return_pct) AS mean_gross_return,
+                   AVG(net_return_pct) AS mean_net_return
+            FROM event_outcomes
+        """).fetchone()
+        research_states = {}
+        for row in self.latest_observations():
+            obs = row["observation"]
+            state = obs.get("state") if obs else None
+            if row["product_state"] != "live":
+                state = "not_returned" if row["product_state"] == "not_returned" else "not_live"
+            if state:
+                research_states[state] = research_states.get(state, 0) + 1
+        return {
+            "product_count": sum(product_states.values()),
+            "product_states": product_states,
+            "research_states": research_states,
+            "latest_observation": latest,
+            "event_counts": self.event_counts(),
+            "outcomes": dict(outcome),
+        }
+
+    def list_events(
+        self, symbol: str | None = None, product_id: str | None = None,
+        event_type: str | None = None, limit: int = 100, offset: int = 0,
+    ) -> dict:
+        conditions, params = [], []
+        if symbol:
+            conditions.append("p.symbol=?")
+            params.append(symbol)
+        if product_id:
+            conditions.append("e.product_id=?")
+            params.append(str(product_id))
+        if event_type:
+            conditions.append("e.event_type=?")
+            params.append(event_type)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        count = self.connection.execute(
+            f"SELECT COUNT(*) AS total FROM events e JOIN products p USING(product_id){where}",
+            params,
+        ).fetchone()["total"]
+        rows = self.connection.execute(f"""
+            SELECT e.id,p.symbol,e.product_id,e.event_time,e.event_type,e.details_json
+            FROM events e JOIN products p USING(product_id){where}
+            ORDER BY e.event_time DESC,e.id DESC LIMIT ? OFFSET ?
+        """, (*params, limit, offset)).fetchall()
+        return {
+            "items": [dict(row) | {"details": json.loads(row["details_json"])}
+                      for row in rows],
+            "total": count, "limit": limit, "offset": offset,
+        }
+
+    def list_outcomes(
+        self, symbol: str | None = None, product_id: str | None = None,
+        variant: str | None = None, horizon_hours: int | None = None,
+        limit: int = 100, offset: int = 0,
+    ) -> dict:
+        conditions, params = [], []
+        if symbol:
+            conditions.append("p.symbol=?")
+            params.append(symbol)
+        if product_id:
+            conditions.append("e.product_id=?")
+            params.append(str(product_id))
+        if horizon_hours is not None:
+            conditions.append("o.horizon_hours=?")
+            params.append(horizon_hours)
+        if variant:
+            conditions.append("json_extract(e.details_json,'$.variant')=?")
+            params.append(variant)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        rows = self.connection.execute(f"""
+            SELECT p.symbol,e.product_id,e.event_time,e.details_json,o.horizon_hours,
+                   o.evaluated_at,o.reference_price,o.exit_price,o.gross_return_pct,
+                   o.estimated_cost_pct,o.net_return_pct
+            FROM event_outcomes o JOIN events e ON e.id=o.event_id
+            JOIN products p ON p.product_id=e.product_id{where}
+            ORDER BY e.event_time DESC,o.horizon_hours LIMIT ? OFFSET ?
+        """, (*params, limit, offset)).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            details = json.loads(item.pop("details_json"))
+            item["variant"] = details.get("variant")
+            items.append(item)
+        count = self.connection.execute(f"""
+            SELECT COUNT(*) AS total FROM event_outcomes o
+            JOIN events e ON e.id=o.event_id
+            JOIN products p ON p.product_id=e.product_id{where}
+        """, params).fetchone()["total"]
+        return {"items": items, "total": count, "limit": limit, "offset": offset}
+
+    def list_candles(self, product_id: str, timeframe: str, limit: int = 500) -> list[dict]:
+        rows = self.connection.execute("""
+            SELECT candle_time AS time,open,high,low,close,volume FROM candles
+            WHERE product_id=? AND timeframe=? ORDER BY candle_time DESC LIMIT ?
+        """, (str(product_id), timeframe, limit)).fetchall()
+        return [dict(row) for row in reversed(rows)]
 
     def event_counts(self) -> dict[str, int]:
         return {row["event_type"]: row["count"] for row in self.connection.execute(

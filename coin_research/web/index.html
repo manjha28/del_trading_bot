@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Delta Market Research</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #647282;
+      --line: #dbe2e9;
+      --surface: #fff;
+      --wash: #f2f5f8;
+      --blue: #175cd3;
+      --green: #067647;
+      --red: #b42318;
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: var(--wash); }
+    header { background: #10233f; color: white; padding: 18px 24px; }
+    header h1 { font-size: 20px; margin: 0 0 4px; }
+    header p { color: #c9d6e5; margin: 0; }
+    main { padding: 20px; max-width: 1800px; margin: auto; }
+    .warning { background: #fff5d6; border: 1px solid #efd477; padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap: 10px; margin: 12px 0 18px; }
+    .card, .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+    .card { padding: 12px 14px; }
+    .card .value { display:block; font-size: 22px; font-weight: 700; }
+    .card .label { color: var(--muted); font-size: 12px; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    .panel { padding: 14px; margin-bottom: 16px; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
+    input, select, button { font: inherit; border:1px solid #c7d0da; border-radius:6px; padding:8px 10px; background:white; color:var(--ink); }
+    input { min-width:190px; }
+    button { cursor:pointer; }
+    button.primary { color:white; background:var(--blue); border-color:var(--blue); }
+    button:disabled { opacity:.5; cursor:default; }
+    .table-wrap { overflow:auto; max-height:65vh; border:1px solid var(--line); border-radius:6px; }
+    table { border-collapse:collapse; width:100%; min-width:900px; background:white; }
+    th,td { border-bottom:1px solid var(--line); padding:8px 9px; text-align:left; vertical-align:top; }
+    th { position:sticky; top:0; background:#e9eef4; z-index:1; white-space:nowrap; }
+    tr:hover td { background:#f7faff; }
+    .symbol { font-weight:700; color:#194185; cursor:pointer; }
+    .muted { color:var(--muted); }
+    .pill { border-radius:999px; display:inline-block; padding:2px 8px; background:#edf2f7; white-space:nowrap; }
+    .pill.good { color:var(--green); background:#e9f7ef; }
+    .pill.bad { color:var(--red); background:#fef0ef; }
+    .json { white-space:pre-wrap; overflow-wrap:anywhere; max-height:65vh; overflow:auto; background:#101828; color:#d5e4f5; padding:14px; border-radius:6px; }
+    .columns { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
+    .subpanel { min-width:0; }
+    .pagination { display:flex; align-items:center; gap:8px; margin-top:10px; }
+    .error { color:var(--red); padding:10px; }
+    .empty { color:var(--muted); padding:14px; }
+    details summary { cursor:pointer; color:var(--blue); }
+    @media(max-width:700px) { main{padding:12px} header{padding:16px} .cards{grid-template-columns:repeat(2,1fr)} }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Delta Exchange India · Market-Wide Research</h1>
+  <p>Read-only discovery, activity states, measurements, execution diagnostics, events, and shadow outcomes.</p>
+</header>
+<main>
+  <div class="warning"><b>Shadow research only.</b> This dashboard does not submit orders or enable live shorts.
+    Discovery is independent of execution eligibility. Missing data remains visible.</div>
+  <div id="status" class="muted">Loading local research database…</div>
+  <section id="summary" class="cards"></section>
+  <section class="panel">
+    <h2>Complete perpetual catalog</h2>
+    <div class="toolbar">
+      <input id="search" placeholder="Search symbol" autocomplete="off">
+      <select id="state"><option value="">All states</option></select>
+      <select id="execution"><option value="">All execution states</option><option value="eligible">Execution eligible</option><option value="ineligible">Execution blocked</option></select>
+      <select id="sort"><option value="symbol">Sort: Symbol</option><option value="sleeping_score">Sort: Sleeping score</option><option value="data_confidence">Sort: Data confidence</option><option value="state">Sort: State</option></select>
+      <button id="refresh" class="primary">Refresh</button>
+    </div>
+    <div class="table-wrap"><table><thead><tr>
+      <th>Symbol</th><th>Catalog state</th><th>Research state</th><th>Sleeping score</th>
+      <th>Confidence</th><th>24h Notional</th><th>Vol 30d</th><th>1h RV</th>
+      <th>ATR 14h</th><th>Spread</th><th>Depth bid / ask</th><th>Execution</th><th>Data age</th>
+    </tr></thead><tbody id="products"></tbody></table></div>
+    <div class="pagination"><button id="previous">Previous</button><span id="page"></span><button id="next">Next</button></div>
+  </section>
+  <section class="panel">
+    <h2 id="detail-title">Select a symbol to inspect its complete measurements</h2>
+    <div id="detail" class="empty">The symbol view includes exchange metadata, latest and prior observations, every raw feature, signals, missing-data notes, state reasons, events, outcomes, and cached candles.</div>
+  </section>
+  <section class="columns">
+    <div class="panel subpanel"><h2>Universe events</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Type</th><th>Details</th></tr></thead><tbody id="events"></tbody></table></div>
+      <div class="pagination"><button id="eventsPrev">Previous</button><span id="eventsPage"></span><button id="eventsNext">Next</button></div></div>
+    <div class="panel subpanel"><h2>Matured shadow outcomes</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Variant</th><th>Horizon</th><th>Gross</th><th>Cost</th><th>Net</th></tr></thead><tbody id="outcomes"></tbody></table></div>
+      <div class="pagination"><button id="outcomesPrev">Previous</button><span id="outcomesPage"></span><button id="outcomesNext">Next</button></div></div>
+  </section>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  const state = {
+    offset: 0, limit: 100, total: 0,
+    eventsOffset: 0, eventsTotal: 0, outcomesOffset: 0, outcomesTotal: 0
+  };
+  const esc = value => String(value ?? "—").replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+  const fmt = (value, digits=2) => value === null || value === undefined || !Number.isFinite(Number(value))
+    ? "—" : Number(value).toLocaleString(undefined,{maximumFractionDigits:digits});
+  const pct = value => value === null || value === undefined ? "—" : `${fmt(value,4)}%`;
+  async function api(path) {
+    const response = await fetch(path, {headers:{"Accept":"application/json"}});
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    return payload;
+  }
+  function summaryCard(label, value) {
+    return `<article class="card"><span class="value">${esc(value)}</span><span class="label">${esc(label)}</span></article>`;
+  }
+  async function loadSummary() {
+    const data = await api("/api/summary");
+    const states = data.research_states || {};
+    const outcomes = data.outcomes || {};
+    $("summary").innerHTML = [
+      summaryCard("Contracts retained", data.product_count),
+      summaryCard("Live", data.product_states?.live || 0),
+      summaryCard("Sleeping", states.sleeping || 0),
+      summaryCard("Awakening / expansion", (states.awakening||0)+(states.expansion||0)+(states.climax||0)),
+      summaryCard("Failed auction", states.failed_auction || 0),
+      summaryCard("Insufficient history", states.insufficient_history || 0),
+      summaryCard("Events", Object.values(data.event_counts||{}).reduce((a,b)=>a+b,0)),
+      summaryCard("Mature outcomes", outcomes.matured || 0),
+      summaryCard("Outcomes with costs", outcomes.with_costs || 0),
+      summaryCard("Mean net price return", pct(outcomes.mean_net_return)),
+      summaryCard("Latest observation", data.latest_observation || "—")
+    ].join("");
+    const stateSelect = $("state");
+    const prior = stateSelect.value;
+    const names = new Set([...Object.keys(states),...Object.keys(data.product_states||{})]);
+    stateSelect.innerHTML = `<option value="">All states</option>` +
+      [...names].sort().map(name=>`<option value="${esc(name)}">${esc(name)}</option>`).join("");
+    stateSelect.value = prior;
+  }
+  async function loadProducts() {
+    const query = new URLSearchParams({
+      search:$("search").value, state:$("state").value, execution:$("execution").value,
+      sort:$("sort").value, limit:String(state.limit), offset:String(state.offset)
+    });
+    const result = await api(`/api/products?${query}`);
+    state.total = result.total;
+    $("products").innerHTML = result.items.map(item => {
+      return `<tr>
+        <td><span class="symbol" data-symbol="${esc(item.symbol)}">${esc(item.symbol)}</span></td>
+        <td>${esc(item.product_state)}</td><td><span class="pill">${esc(item.state)}</span></td>
+        <td>${fmt(item.sleeping_score,1)}</td><td>${fmt(item.data_confidence,2)}</td>
+        <td>${fmt(item.notional_24h,0)}</td><td>${fmt(item.volume_ratio_30d,2)}x</td>
+        <td>${fmt(item.realized_volatility_1h_annualized_pct,2)}%</td>
+        <td>${pct(item.atr_14h_pct)}</td><td>${pct(item.spread_pct)}</td>
+        <td>${fmt(item.bid_depth_usd_5,0)} / ${fmt(item.ask_depth_usd_5,0)}</td>
+        <td><span class="pill ${item.execution_eligible?'good':'bad'}">${item.execution_eligible?'Eligible':'Blocked'}</span></td>
+        <td>${fmt(item.hourly_data_age_seconds,0)}s</td></tr>`;
+    }).join("") || `<tr><td colspan="13" class="empty">No products match this filter.</td></tr>`;
+    $("page").textContent = `${state.total ? state.offset+1 : 0}–${Math.min(state.offset+state.limit,state.total)} of ${state.total}`;
+    $("previous").disabled = state.offset <= 0;
+    $("next").disabled = state.offset + state.limit >= state.total;
+  }
+  function objectView(title, value) {
+    return `<details open><summary>${esc(title)}</summary><pre class="json">${esc(JSON.stringify(value,null,2))}</pre></details>`;
+  }
+  async function loadDetail(symbol) {
+    $("detail-title").textContent = `${symbol} · loading`;
+    const item = await api(`/api/products/${encodeURIComponent(symbol)}`);
+    const latest = item.observations?.[0]?.observation || {};
+    $("detail-title").textContent = `${symbol} · ${latest.state || item.state || "no observation"}`;
+    $("detail").className = "";
+    $("detail").innerHTML = `<div class="columns">
+      <div>${objectView("Exchange product metadata",item.metadata)}
+        ${objectView("Latest observation · all features / signals / eligibility",latest)}</div>
+      <div>${objectView("Observation history",item.observations)}
+        ${objectView("Events and rejections",item.events)}
+        ${objectView("Matured outcomes",item.outcomes)}</div></div>
+      <div class="columns">
+        ${["1h","5m","1m"].map(tf=>`<div><h3>Cached ${tf} candles</h3>
+          <button data-candles="${tf}" data-symbol="${esc(symbol)}">Load ${tf} candles</button>
+          <pre id="candles-${tf}" class="json">Not loaded</pre></div>`).join("")}</div>`;
+    document.querySelectorAll("[data-candles]").forEach(button => button.addEventListener("click", async () => {
+      const candles = await api(`/api/products/${encodeURIComponent(symbol)}/candles?timeframe=${button.dataset.candles}&limit=500`);
+      $(`candles-${button.dataset.candles}`).textContent = JSON.stringify(candles,null,2);
+    }));
+    window.scrollTo({top:$("detail").getBoundingClientRect().top + window.scrollY - 12,behavior:"smooth"});
+  }
+  async function loadEvents() {
+    const data = await api(`/api/events?limit=100&offset=${state.eventsOffset}`);
+    state.eventsTotal = data.total;
+    $("events").innerHTML = data.items.map(item=>`<tr><td>${esc(item.event_time)}</td>
+      <td><span class="symbol" data-symbol="${esc(item.symbol)}">${esc(item.symbol)}</span></td>
+      <td>${esc(item.event_type)}</td><td>${esc(JSON.stringify(item.details))}</td></tr>`).join("")
+      || `<tr><td colspan="4" class="empty">No events recorded.</td></tr>`;
+    $("eventsPage").textContent = `${state.eventsTotal ? state.eventsOffset+1 : 0}–${Math.min(state.eventsOffset+100,state.eventsTotal)} of ${state.eventsTotal}`;
+    $("eventsPrev").disabled = state.eventsOffset <= 0;
+    $("eventsNext").disabled = state.eventsOffset + 100 >= state.eventsTotal;
+  }
+  async function loadOutcomes() {
+    const data = await api(`/api/outcomes?limit=100&offset=${state.outcomesOffset}`);
+    state.outcomesTotal = data.total;
+    $("outcomes").innerHTML = data.items.map(item=>`<tr><td>${esc(item.event_time)}</td>
+      <td><span class="symbol" data-symbol="${esc(item.symbol)}">${esc(item.symbol)}</span></td>
+      <td>${esc(item.variant)}</td><td>${esc(item.horizon_hours)}h</td>
+      <td>${pct(item.gross_return_pct)}</td><td>${pct(item.estimated_cost_pct)}</td>
+      <td class="${item.net_return_pct>0?'good':''}">${pct(item.net_return_pct)}</td></tr>`).join("")
+      || `<tr><td colspan="7" class="empty">No matured outcomes yet.</td></tr>`;
+    $("outcomesPage").textContent = `${state.outcomesTotal ? state.outcomesOffset+1 : 0}–${Math.min(state.outcomesOffset+100,state.outcomesTotal)} of ${state.outcomesTotal}`;
+    $("outcomesPrev").disabled = state.outcomesOffset <= 0;
+    $("outcomesNext").disabled = state.outcomesOffset + 100 >= state.outcomesTotal;
+  }
+  async function refresh() {
+    $("status").textContent = "Refreshing data from local research database…";
+    try {
+      await Promise.all([loadSummary(),loadProducts(),loadEvents(),loadOutcomes()]);
+      $("status").textContent = `Database refreshed at ${new Date().toLocaleTimeString()}.`;
+    } catch (error) {
+      $("status").innerHTML = `<span class="error">${esc(error.message)}</span>`;
+    }
+  }
+  let searchTimer;
+  $("search").addEventListener("input",()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{state.offset=0;loadProducts().catch(e=>$("status").textContent=e.message)},250)});
+  ["state","execution","sort"].forEach(id=>$(id).addEventListener("change",()=>{state.offset=0;loadProducts().catch(e=>$("status").textContent=e.message)}));
+  $("refresh").addEventListener("click",refresh);
+  $("previous").addEventListener("click",()=>{state.offset=Math.max(0,state.offset-state.limit);loadProducts()});
+  $("next").addEventListener("click",()=>{state.offset+=state.limit;loadProducts()});
+  $("eventsPrev").addEventListener("click",()=>{state.eventsOffset=Math.max(0,state.eventsOffset-100);loadEvents()});
+  $("eventsNext").addEventListener("click",()=>{state.eventsOffset+=100;loadEvents()});
+  $("outcomesPrev").addEventListener("click",()=>{state.outcomesOffset=Math.max(0,state.outcomesOffset-100);loadOutcomes()});
+  $("outcomesNext").addEventListener("click",()=>{state.outcomesOffset+=100;loadOutcomes()});
+  document.addEventListener("click",event=>{
+    const node=event.target.closest("[data-symbol]");
+    if(node) loadDetail(node.dataset.symbol).catch(error=>{$("detail").textContent=error.message});
+  });
+  refresh();
+</script>
+</body>
+</html>
