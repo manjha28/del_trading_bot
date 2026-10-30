@@ -17,7 +17,8 @@ from vpvr.strategies import StrategySignal, _make
 from vpvr.paper import PaperBroker
 from vpvr.data import DeltaMarketData
 from vpvr.stream import DeltaPublicStream
-from vpvr.backtest import BacktestConfig, run_backtest, _completed_1m_history
+from vpvr.backtest import BacktestConfig, run_backtest, _completed_1m_history, _quantity
+from vpvr.engine import VPVREngine
 
 
 class ProfileTests(unittest.TestCase):
@@ -173,6 +174,37 @@ class PaperTests(unittest.TestCase):
             path=Path(directory)/"paper.json";path.write_text("{broken")
             with self.assertRaises(RuntimeError):PaperBroker(path)
 
+    def test_two_targets_leave_runner_and_trail_structurally(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker=PaperBroker(Path(directory)/"paper.json",initial_balance=1000,
+                fee_rate=0,slippage_bps=0,trailing_buffer_pct=.001)
+            broker.queue_signal(self.signal(),1)
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:00:00Z",100,102,100,101))
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:01:00Z",100,102,100,101))
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:02:00Z",101,106,102,105))
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:03:00Z",106,110,106,109))
+            position=broker.state["positions"]["BTCUSD"]
+            self.assertAlmostEqual(position["remaining"],.25)
+            self.assertEqual(position["target_index"],2)
+            self.assertEqual(position["stop"],105.0)
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:04:00Z",108,109,107,108))
+            tightened=broker.state["positions"]["BTCUSD"]["stop"]
+            self.assertGreater(tightened,105.0)
+            events=broker.process_candle("BTCUSD",self.candle("2026-01-01T00:05:00Z",106,108,105.8,106))
+            self.assertTrue(any(e.get("reason")=="TRAIL_STOP" for e in events))
+            self.assertNotIn("BTCUSD",broker.state["positions"])
+
+    def test_partial_target_then_tightened_stop_is_conservative_same_bar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker=PaperBroker(Path(directory)/"paper.json",initial_balance=1000,
+                fee_rate=0,slippage_bps=0)
+            broker.queue_signal(self.signal(),1)
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:00:00Z",100,102,100,101))
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:01:00Z",100,102,100,101))
+            events=broker.process_candle("BTCUSD",self.candle("2026-01-01T00:02:00Z",101,106,100,103))
+            self.assertTrue(any(e.get("reason")=="SAME_BAR_TIGHTENED_STOP" for e in events))
+            self.assertNotIn("BTCUSD",broker.state["positions"])
+
     def test_funding_requires_an_explicit_timestamped_settlement_event(self):
         with tempfile.TemporaryDirectory() as directory:
             broker=PaperBroker(Path(directory)/"paper.json",initial_balance=1000,
@@ -202,6 +234,30 @@ class DataTests(unittest.TestCase):
         self.assertEqual(len(trades),2)
         self.assertEqual(float(trades.volume.sum()),4.0)
 
+    def test_funding_history_loader_and_staleness_check(self):
+        data=DeltaMarketData(config=VPVRConfig())
+        now=1767225600
+        payload={"result":[{"time":now-3600,"close":0.0002}]}
+        with patch.object(data,"_get_json",return_value=payload):
+            self.assertAlmostEqual(data.fetch_current_funding_rate("BTCUSD",now=now),0.0002)
+        stale={"result":[{"time":now-12*3600,"close":0.0002}]}
+        with patch.object(data,"_get_json",return_value=stale):
+            with self.assertRaisesRegex(Exception,"stale"):
+                data.fetch_current_funding_rate("BTCUSD",now=now)
+
+    def test_contract_specs_require_operational_market_and_verified_size_fields(self):
+        data=DeltaMarketData(config=VPVRConfig())
+        product={"contract_value":"1","tick_size":"0.1","lot_size":"1",
+                 "minimum_order_size":"1","trading_status":"operational",
+                 "position_size_limit":"1000"}
+        specs=data.contract_specs(product)
+        self.assertTrue(specs["spec_verified"])
+        self.assertEqual(specs["position_size_limit"],1000)
+        unverified=data.contract_specs({k:v for k,v in product.items() if k not in ("lot_size","minimum_order_size")})
+        self.assertFalse(unverified["spec_verified"])
+        inactive=data.contract_specs({**product,"trading_status":"suspended"})
+        self.assertIsNone(inactive)
+
     def test_freshness_detects_gaps(self):
         data=DeltaMarketData(config=VPVRConfig())
         now=pd.Timestamp("2026-01-01T00:03:00Z").timestamp()
@@ -209,6 +265,27 @@ class DataTests(unittest.TestCase):
         self.assertTrue(data.freshness(good,"1m",now=now)[0])
         gap=pd.DataFrame({"time":pd.to_datetime(["2026-01-01T00:00:00Z","2026-01-01T00:02:00Z"],utc=True)})
         self.assertFalse(data.freshness(gap,"1m",now=now)[0])
+
+
+class EngineTests(unittest.TestCase):
+    def test_pure_analysis_engine_returns_profile_regime_and_diagnostics(self):
+        base=pd.Timestamp("2026-01-01T00:00:00Z")
+        def frame(count,minutes):
+            times=[base+pd.Timedelta(minutes=minutes*i) for i in range(count)]
+            return pd.DataFrame({"time":times,"open":[100.]*count,"high":[100.2]*count,
+                "low":[99.8]*count,"close":[100.]*count,"volume":[10.]*count})
+        result=VPVREngine(VPVRConfig()).analyse("BTCUSD",frame(80,1),frame(40,3),frame(40,15))
+        self.assertEqual(result.symbol,"BTCUSD")
+        self.assertEqual(result.profile.source,"ohlcv_uniform_range_approximation")
+        self.assertIn("ema20_1m",result.diagnostics)
+        self.assertFalse(result.diagnostics["cvd"]["available"])
+
+    def test_analysis_engine_rejects_duplicate_candle_timestamps(self):
+        base=pd.Timestamp("2026-01-01T00:00:00Z")
+        frame=pd.DataFrame({"time":[base,base],"open":[100.,100.],"high":[101.,101.],
+            "low":[99.,99.],"close":[100.,100.],"volume":[10.,10.]})
+        with self.assertRaisesRegex(ValueError,"duplicated"):
+            VPVREngine._validate_frame(frame,"1m")
 
 
 class StreamTests(unittest.TestCase):
@@ -237,6 +314,17 @@ class StreamTests(unittest.TestCase):
 
 
 class BacktestTests(unittest.TestCase):
+    def test_backtest_quantity_respects_lot_minimum_tick_and_exchange_cap(self):
+        qty,stop=_quantity(1000,100,99.16,"LONG",1.0,BacktestConfig(),
+            lot_size=.5,min_qty=.5,tick_size=.1,position_size_limit=3.0)
+        self.assertEqual(qty,3.0)
+        self.assertAlmostEqual(stop,99.1)
+
+    def test_backtest_quantity_rejects_minimum_exceeding_risk_budget(self):
+        qty,_=_quantity(1000,100,99.9,"LONG",1.0,BacktestConfig(),
+            lot_size=1,min_qty=10,tick_size=.01)
+        self.assertEqual(qty,0.0)
+
     def test_completed_history_excludes_current_forming_1m_bar(self):
         frame=pd.DataFrame({"time":pd.date_range("2026-01-01",periods=4,freq="1min",tz="UTC")})
         history=_completed_1m_history(frame,3)
