@@ -65,8 +65,10 @@ class IndicatorTests(unittest.TestCase):
         self.assertFalse(result["available"])
 
     def test_divergence_flags_price_lower_low_cvd_higher_low(self):
-        candles=pd.DataFrame({"close":[100,98,99,97,98]})
-        deltas=pd.DataFrame({"cvd":[10,5,7,8,9]})
+        candles=pd.DataFrame({"time":pd.date_range("2026-01-01",periods=5,freq="1min",tz="UTC"),
+            "close":[100,98,99,97,98]})
+        deltas=pd.DataFrame({"cvd":[10,5,7,8,9]},
+            index=pd.date_range("2026-01-01",periods=5,freq="1min",tz="UTC"))
         result=delta_divergence(candles,deltas,lookback=5)
         self.assertTrue(result["available"])
         self.assertTrue(result["bullish"])
