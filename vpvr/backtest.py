@@ -27,7 +27,7 @@ class BacktestConfig:
     max_chase_bps: float = 10.0
     trailing_buffer_pct: float = 0.001
 
-def _clean(frame):
+def _clean(frame, interval_minutes=None):
     required = {"time","open","high","low","close","volume"}
     if frame is None or not required.issubset(frame.columns):
         raise ValueError(f"candles must contain {sorted(required)}")
@@ -41,7 +41,16 @@ def _clean(frame):
         raise ValueError("OHLCV contains non-positive prices or negative volume")
     if (x.high < x.low).any():
         raise ValueError("candle high is below candle low")
-    return x.reset_index(drop=True)
+    x=x.reset_index(drop=True)
+    if interval_minutes is not None and len(x) > 1:
+        gaps=x.time.diff().dropna().dt.total_seconds()
+        if (gaps != interval_minutes * 60).any():
+            raise ValueError(f"candle history contains gaps for {interval_minutes}m timeframe")
+    return x
+
+def _completed_1m_history(candles, current_index):
+    """Only candles strictly before current_index are completed at its open."""
+    return candles.iloc[:current_index].copy()
 
 def _quantity(equity, entry, stop, direction, multiplier, cfg):
     distance = entry-stop if direction=="LONG" else stop-entry
@@ -91,7 +100,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
     fabricated.
     """
     cfg=config or BacktestConfig()
-    c1,c3,c15=_clean(candles_1m),_clean(candles_3m),_clean(candles_15m)
+    c1,c3,c15=_clean(candles_1m,1),_clean(candles_3m,3),_clean(candles_15m,15)
     if min(len(c1),len(c3),len(c15))<35:
         raise ValueError("insufficient candles for EMA/profile warm-up")
     if contract_multiplier<=0:
@@ -126,7 +135,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                 trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":fill,"exit_reason":"STOP",
                     "holding_minutes":(ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60})
                 consecutive_losses=consecutive_losses+1 if net<0 else 0
-                equity_curve.append(equity);position=None
+                position=None
             else:
                 targets=pos["targets"]
                 fractions=[1.0] if len(targets)==1 else ([.30,.45] if len(targets)==2 else [.30,.45,.25])
@@ -146,7 +155,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                     trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":targets[-1],"exit_reason":"TARGETS",
                         "holding_minutes":(ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60})
                     consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
-                    equity_curve.append(equity);position=None
+                position=None
                 elif (ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60>=cfg.max_hold_minutes:
                     fill=bar["close"]*(1-cfg.slippage_bps/10000 if direction=="LONG" else 1+cfg.slippage_bps/10000)
                     qty=pos["remaining"]
@@ -156,7 +165,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                     trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":fill,"exit_reason":"TIMEOUT",
                         "holding_minutes":cfg.max_hold_minutes})
                     consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
-                    equity_curve.append(equity);position=None
+                position=None
                 if position is pos:
                     pos["last_candle_low"]=bar["low"]
                     pos["last_candle_high"]=bar["high"]
@@ -186,14 +195,14 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                             "stop":sig.stop_loss,"targets":list(sig.targets[:3]),"quantity":qty,"remaining":qty,
                             "opened_at":ts.isoformat(),"target_index":0,"gross_pnl":0.0,"fees":fee,"net_pnl":-fee,
                             "last_candle_low":bar["low"],"last_candle_high":bar["high"],"regime":pending["regime"]}
-                        equity_curve.append(equity)
+
                     else:
                         skipped["risk_or_sizing_reject"]+=1
                     pending=None
 
         # Only bars whose end timestamp is <= the current 1m candle start are usable.
         if position is None and pending is None:
-            c1hist=c1.iloc[:i+1]
+            c1hist=_completed_1m_history(c1,i)
             c3hist=c3.loc[(c3.time+pd.Timedelta(minutes=3))<=ts]
             c15hist=c15.loc[(c15.time+pd.Timedelta(minutes=15))<=ts]
             if len(c3hist)>=30 and len(c15hist)>=30:
@@ -210,6 +219,21 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                         pending={"signal":sig,"bars_waited":0,"regime":regime.regime.value}
                 except ValueError:
                     skipped["profile_or_signal_error"]+=1
+
+        # Mark open exposure to market and include the adverse intrabar excursion.
+        # This improves drawdown visibility; it is not an exchange liquidation model.
+        if position is not None:
+            direction=position["direction"]
+            qty=float(position["remaining"])*contract_multiplier
+            entry=float(position["entry"])
+            adverse_price=bar["low"] if direction=="LONG" else bar["high"]
+            close_price=bar["close"]
+            adverse_unrealized=((adverse_price-entry) if direction=="LONG" else (entry-adverse_price))*qty
+            close_unrealized=((close_price-entry) if direction=="LONG" else (entry-close_price))*qty
+            equity_curve.append(equity+min(adverse_unrealized,close_unrealized))
+            equity_curve.append(equity+close_unrealized)
+        else:
+            equity_curve.append(equity)
 
     metrics=_metrics(cfg.initial_balance,trades,equity_curve)
     by_strategy={}
