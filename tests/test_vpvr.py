@@ -16,6 +16,7 @@ from vpvr.risk import RiskEngine
 from vpvr.strategies import StrategySignal, _make
 from vpvr.paper import PaperBroker
 from vpvr.data import DeltaMarketData
+from vpvr.cli import _current_paper_marks
 from vpvr.stream import DeltaPublicStream
 from vpvr.backtest import BacktestConfig, run_backtest, _completed_1m_history, _quantity
 from vpvr.engine import VPVREngine
@@ -100,6 +101,20 @@ class RiskTests(unittest.TestCase):
             leverage=10,contract_multiplier=1,lot_size=1,min_qty=10,tick_size=.01)
         self.assertFalse(too_small.accepted)
         self.assertIn("below exchange minimum",too_small.reason)
+
+
+    def test_btc_contract_multiplier_sizes_integer_order_contracts(self):
+        engine = RiskEngine(self.cfg)
+        engine.reset_day(1000, date(2026, 1, 1))
+        decision = engine.size(
+            equity=1000, entry=80000, stop=79000, direction="LONG",
+            leverage=10, contract_multiplier=0.001, lot_size=1, min_qty=1,
+            tick_size=0.5, fee_rate=0.0005, slippage_bps=2, max_qty=125000,
+        )
+        self.assertTrue(decision.accepted, decision.reason)
+        self.assertEqual(decision.quantity, 4)
+        self.assertIsInstance(decision.quantity, int)
+        self.assertEqual(decision.notional, 320.0)
 
     def test_exchange_position_size_limit_caps_quantity(self):
         engine=RiskEngine(self.cfg);engine.reset_day(1000,date(2026,1,1))
@@ -225,6 +240,21 @@ class PaperTests(unittest.TestCase):
 
 
 class DataTests(unittest.TestCase):
+
+    def test_paper_equity_marks_use_current_ticker_and_last_confirmed_fallback(self):
+        positions = {
+            "BTCUSD": {"entry": 79000.0, "last_mark": 80000.0},
+            "ETHUSD": {"entry": 2900.0, "last_mark": 3000.0},
+            "SOLUSD": {"entry": 100.0, "last_mark": 101.0},
+        }
+        tickers = {
+            "BTCUSD": {"mark_price": "81000"},
+            "ETHUSD": {"mark_price": None, "close": "3050"},
+            "SOLUSD": {},
+        }
+        marks = _current_paper_marks(positions, tickers)
+        self.assertEqual(marks, {"BTCUSD": 81000.0, "ETHUSD": 3050.0, "SOLUSD": 101.0})
+
     def test_public_trade_loader_preserves_identical_distinct_execution_rows(self):
         data=DeltaMarketData(config=VPVRConfig())
         duplicate={"price":100.0,"size":2.0,"side":"buy","timestamp":1767225600000000}
@@ -245,18 +275,136 @@ class DataTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception,"stale"):
                 data.fetch_current_funding_rate("BTCUSD",now=now)
 
-    def test_contract_specs_require_operational_market_and_verified_size_fields(self):
-        data=DeltaMarketData(config=VPVRConfig())
-        product={"contract_value":"1","tick_size":"0.1","lot_size":"1",
-                 "minimum_order_size":"1","trading_status":"operational",
-                 "position_size_limit":"1000"}
-        specs=data.contract_specs(product)
+
+    def _valid_product(self, symbol="BTCUSD", **overrides):
+        defaults = {
+            "symbol": symbol,
+            "contract_type": "perpetual_futures",
+            "state": "live",
+            "trading_status": "operational",
+            "notional_type": "vanilla",
+            "is_quanto": False,
+            "contract_value": "0.001" if symbol == "BTCUSD" else "0.01",
+            "contract_unit_currency": "BTC" if symbol == "BTCUSD" else "ETH",
+            "tick_size": "0.5" if symbol == "BTCUSD" else "0.05",
+            "position_size_limit": "125000",
+        }
+        return {**defaults, **overrides}
+
+    def test_btc_contract_specs_verify_against_documented_minimum(self):
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(self._valid_product())
+        self.assertTrue(specs["spec_verified"], specs["verification_errors"])
+        self.assertEqual(specs["contract_multiplier"], 0.001)
+        self.assertEqual(specs["contract_unit_currency"], "BTC")
+        self.assertEqual(specs["lot_size"], 1)
+        self.assertEqual(specs["min_qty"], 1)
+        self.assertEqual(specs["minimum_underlying_qty"], "0.001")
+        self.assertEqual(specs["tick_size"], 0.5)
+        self.assertEqual(specs["position_size_limit"], 125000)
+        self.assertTrue(specs["lot_increment_verified"])
+        self.assertTrue(specs["minimum_quantity_verified"])
+        self.assertIsNone(specs["sizing_assumption"])
+
+    def test_eth_contract_specs_verify_against_documented_minimum(self):
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(self._valid_product("ETHUSD"))
+        self.assertTrue(specs["spec_verified"], specs["verification_errors"])
+        self.assertEqual(specs["contract_multiplier"], 0.01)
+        self.assertEqual(specs["contract_unit_currency"], "ETH")
+        self.assertEqual(specs["lot_size"], 1)
+        self.assertEqual(specs["min_qty"], 1)
+        self.assertEqual(specs["minimum_order_contracts"], 1)
+        self.assertEqual(specs["tick_size"], 0.05)
+
+    def test_minimum_underlying_quantity_must_convert_exactly_to_contracts(self):
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(
+            self._valid_product(contract_value="0.002")
+        )
+        self.assertFalse(specs["spec_verified"])
+        self.assertIsNone(specs["min_qty"])
+        self.assertIn(
+            "minimum_underlying_quantity_does_not_convert_to_integer_contracts",
+            specs["verification_errors"],
+        )
+
+    def test_delta_order_increment_is_integer_contract_count(self):
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(self._valid_product())
+        self.assertEqual(specs["lot_size"], 1)
+        self.assertTrue(specs["lot_increment_verified"])
+        self.assertIn("integer number of contracts", specs["verification_source"]["increment_basis"])
+
+    def test_live_contract_multiplier_and_tick_are_used(self):
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(self._valid_product(tick_size="0.25"))
+        self.assertEqual(specs["contract_multiplier"], 0.001)
+        self.assertEqual(specs["tick_size"], 0.25)
+
+    def test_position_size_limit_is_integer_order_contract_count(self):
+        data = DeltaMarketData(config=VPVRConfig())
+        specs = data.contract_specs(self._valid_product(position_size_limit="1234"))
         self.assertTrue(specs["spec_verified"])
-        self.assertEqual(specs["position_size_limit"],1000)
-        unverified=data.contract_specs({k:v for k,v in product.items() if k not in ("lot_size","minimum_order_size")})
-        self.assertFalse(unverified["spec_verified"])
-        inactive=data.contract_specs({**product,"trading_status":"suspended"})
-        self.assertIsNone(inactive)
+        self.assertEqual(specs["position_size_limit"], 1234)
+        invalid = data.contract_specs(self._valid_product(position_size_limit="1234.5"))
+        self.assertFalse(invalid["spec_verified"])
+        self.assertIsNone(invalid["position_size_limit"])
+
+    def test_unknown_symbol_remains_unverified(self):
+        product = self._valid_product("SOLUSD", contract_value="1", contract_unit_currency="SOL")
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(product)
+        self.assertFalse(specs["spec_verified"])
+        self.assertIn("unsupported_symbol: no verified BTCUSD/ETHUSD sizing policy", specs["verification_errors"])
+
+    def test_missing_contract_value_remains_unverified(self):
+        product = self._valid_product()
+        product.pop("contract_value")
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(product)
+        self.assertFalse(specs["spec_verified"])
+        self.assertIn("contract_value_missing_or_invalid", specs["verification_errors"])
+
+    def test_missing_contract_unit_currency_remains_unverified(self):
+        product = self._valid_product()
+        product.pop("contract_unit_currency")
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(product)
+        self.assertFalse(specs["spec_verified"])
+        self.assertIn("contract_unit_currency_does_not_match_symbol_policy", specs["verification_errors"])
+
+    def test_contract_value_mismatch_remains_unverified(self):
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(
+            self._valid_product(contract_value="0.002")
+        )
+        self.assertFalse(specs["spec_verified"])
+        self.assertIn("contract_value_does_not_match_published_symbol_policy", specs["verification_errors"])
+        self.assertFalse(specs["minimum_quantity_verified"])
+
+    def test_wrong_underlying_currency_remains_unverified(self):
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(
+            self._valid_product(contract_unit_currency="USD")
+        )
+        self.assertFalse(specs["spec_verified"])
+        self.assertIn("contract_unit_currency_does_not_match_symbol_policy", specs["verification_errors"])
+
+    def test_quanto_and_inverse_products_remain_unverified(self):
+        data = DeltaMarketData(config=VPVRConfig())
+        quanto = data.contract_specs(self._valid_product(is_quanto=True))
+        inverse = data.contract_specs(self._valid_product(notional_type="inverse"))
+        self.assertFalse(quanto["spec_verified"])
+        self.assertFalse(inverse["spec_verified"])
+        self.assertIn("is_quanto_must_be_explicit_false", quanto["verification_errors"])
+        self.assertIn("notional_type_must_be_vanilla", inverse["verification_errors"])
+
+    def test_non_operational_or_non_live_products_remain_unverified(self):
+        data = DeltaMarketData(config=VPVRConfig())
+        suspended = data.contract_specs(self._valid_product(trading_status="suspended"))
+        expired = data.contract_specs(self._valid_product(state="expired"))
+        self.assertFalse(suspended["spec_verified"])
+        self.assertFalse(expired["spec_verified"])
+        self.assertIn("trading_status_must_be_operational", suspended["verification_errors"])
+        self.assertIn("product_state_must_be_live", expired["verification_errors"])
+
+    def test_incomplete_metadata_never_produces_false_positive(self):
+        partial = {"symbol": "BTCUSD", "contract_value": "0.001", "tick_size": "0.5"}
+        specs = DeltaMarketData(config=VPVRConfig()).contract_specs(partial)
+        self.assertFalse(specs["spec_verified"])
+        self.assertTrue(specs["verification_errors"])
+        self.assertIsNotNone(specs["metadata_received"])
 
     def test_freshness_detects_gaps(self):
         data=DeltaMarketData(config=VPVRConfig())

@@ -68,8 +68,40 @@ Paper-state JSON is stored under `data/` by default and is ignored by Git. Do no
 - Session VWAP currently resets at UTC midnight. Configure a different session definition before using it for non-UTC exchange sessions.
 
 ## Data limitations and operational cautions
-- Paper execution is blocked unless Delta reports an operational product with verified lot increment and minimum quantity. Signal-only scans may show signals without computing a position quantity when size metadata is missing. The paper adapter retains a 1-contract fallback solely for diagnostics and never uses it to queue paper positions.
+- Paper execution is blocked unless supported BTCUSD/ETHUSD product metadata passes the versioned contract policy. The verifier checks live product identity/state, operational status, vanilla notional, non-quanto status, live contract value/unit currency, live tick size, and integer position-size limit. Delta documents integer order-size contracts and minimum underlying order sizes of 0.001 BTC and 0.01 ETH; the verifier divides the published minimum by the live contract value and requires an exact integer contract count. The policy is intentionally limited to BTCUSD and ETHUSD; unknown symbols remain blocked. It never substitutes an assumed minimum or a default 1-contract value when verification fails.
 - The entry filter reads Delta's public `FUNDING:<symbol>` candle history and fails closed when the latest rate is unavailable/stale or exceeds `VPVR_MAX_ABS_FUNDING_RATE`. Funding is an entry filter only. The paper broker charges funding only when supplied an explicit timestamped funding-settlement event; the REST polling loop does not source settlement events, so paper PnL does not include funding. Historical funding is not included in the first backtest engine.
 - The backtester assumes stop-first if stop and target touch in the same 1m candle, includes configured fees/slippage, and cannot model queue position or partial exchange fills.
 - Candle API history is chunked for backfill. Gaps, stale bars, incomplete bars, unknown contract multiplier/tick, missing spread quotes, or failed API requests cause no-trade behavior.
 - A paper result is not a profitability claim. Validate out-of-sample, per-symbol, per-regime and after realistic fees before considering any separate live execution project.
+
+
+## Strategy dashboard
+
+The optional Streamlit dashboard displays the backend scan response, contract verification diagnostics, Volume Profile levels, indicators, strategy signals, paper positions, pending entries, closed trades, and backtest results. It uses the existing VPVR scanner, engine, backtester and local JSON paper journal; it does not add an order API or a live-execution control.
+
+Install the dashboard dependency and run it from the repository root:
+
+```bash
+python -m pip install -r requirements-dashboard.txt
+streamlit run vpvr/dashboard.py
+```
+
+Open the local URL printed by Streamlit (normally http://localhost:8501).
+
+### Dashboard workflow
+
+1. Select BTCUSD and/or ETHUSD, choose signal-only or paper scan, and click **Fetch latest market data**.
+2. Inspect contract metadata verification, market regime, spread, funding, profile provenance, indicators, and all returned signals.
+3. Review the local paper journal. The paper scan may queue a virtual trigger; it cannot submit exchange orders.
+4. In Backtest workbench, upload aligned 1m, 3m and 15m OHLCV CSVs. When a recent scan has verified contract metadata, the backtester uses it. Otherwise, backtesting requires an explicit manual research-assumptions checkbox and labels the result as unverified; these values do not affect paper sizing.
+5. Use Raw backend data to inspect the complete JSON scan response.
+
+The dashboard does not automatically run continuous polling. Trigger a new scan manually to refresh the market snapshot. The paper journal is read from `VPVR_PAPER_STATE_FILE` (default `data/vpvr_paper_state.json`).
+
+
+### Contract specification sources
+
+- Delta product schema and order API: https://docs.delta.exchange/
+- Delta India published futures minimum order sizes: BTC 0.001 BTC; ETH 0.01 ETH: https://deltaexchangeindia.freshdesk.com/support/solutions/articles/80001132372-what-is-the-minimum-order-size-for-futures-trading-
+
+The contract verifier records the exact product metadata it received, the policy version, the normalized contract count, the order-size cap, source references, and any failed verification reasons in each scan result.

@@ -64,6 +64,22 @@ def _restore_risk(engine, broker, today):
                                    if str(row.get("closed_at","")).startswith(key))
 
 
+
+def _current_paper_marks(positions, tickers):
+    """Mark open paper positions from current tickers, falling back to last confirmed marks."""
+    marks = {}
+    for symbol, position in positions.items():
+        ticker = tickers.get(symbol, {})
+        raw_mark = ticker.get("mark_price") or ticker.get("close")
+        fallback = position.get("last_mark") or position["entry"]
+        try:
+            mark = float(raw_mark) if raw_mark is not None else float(fallback)
+            marks[symbol] = mark if mark > 0 else float(fallback)
+        except (TypeError, ValueError):
+            marks[symbol] = float(fallback)
+    return marks
+
+
 def _process_new_paper_bars(broker, symbol, candles):
     last=broker.state.get("last_processed",{}).get(symbol)
     if last is None:
@@ -98,17 +114,20 @@ def scan_once(symbols, paper=False, config=None):
         if product is None:
             output.append({"symbol":symbol,"status":"not_a_live_delta_perpetual"})
             continue
+        specs=data.contract_specs(product)
         try:
             frames={tf:data.fetch_candles(symbol,tf,300) for tf in ("1m","3m","15m")}
             freshness={tf:data.freshness(frames[tf],tf) for tf in frames}
             if not all(ok for ok,_ in freshness.values()):
-                output.append({"symbol":symbol,"status":"no_trade_stale_or_incomplete_data","freshness":freshness})
+                output.append({"symbol":symbol,"status":"no_trade_stale_or_incomplete_data","freshness":freshness,
+                    "contract_specs":specs})
                 continue
             ticker=tickers.get(symbol,{})
             bid,ask,spread=_best_quote(data,ticker,symbol)
             if spread is None or spread>cfg.max_spread_pct:
                 output.append({"symbol":symbol,"status":"no_trade_spread_unavailable_or_too_wide",
-                    "bid":bid,"ask":ask,"spread_pct":spread,"max_spread_pct":cfg.max_spread_pct})
+                    "bid":bid,"ask":ask,"spread_pct":spread,"max_spread_pct":cfg.max_spread_pct,
+                    "contract_specs":specs})
                 continue
             # Funding is an entry filter only. We require a fresh public FUNDING
             # candle; unavailable/stale funding is a no-trade condition.
@@ -116,11 +135,12 @@ def scan_once(symbols, paper=False, config=None):
                 funding=data.fetch_current_funding_rate(symbol)
             except MarketDataError as exc:
                 output.append({"symbol":symbol,"status":"no_trade_funding_rate_unavailable",
-                    "reason":str(exc)})
+                    "reason":str(exc),"contract_specs":specs})
                 continue
             if abs(funding)>cfg.max_abs_funding_rate:
                 output.append({"symbol":symbol,"status":"no_trade_funding_rate_exceeded",
-                    "funding_rate":funding,"max_abs_funding_rate":cfg.max_abs_funding_rate})
+                    "funding_rate":funding,"max_abs_funding_rate":cfg.max_abs_funding_rate,
+                    "contract_specs":specs})
                 continue
 
             # Process fresh, unique completed 1m bars and reconcile any closes into risk state.
@@ -159,7 +179,6 @@ def scan_once(symbols, paper=False, config=None):
             tape_covers_window=bool(diagnostics["trade_tape_covers_profile_window"])
             cvd=diagnostics["cvd"]
             divergence=diagnostics["delta_divergence"]
-            specs=data.contract_specs(product)
             if specs is None:
                 output.append({"symbol":symbol,"status":"contract_metadata_incomplete",
                     "profile":profile.as_dict(),"regime":regime.regime.value,
@@ -172,7 +191,8 @@ def scan_once(symbols, paper=False, config=None):
                     signal_rows.append({"signal":signal.as_dict(),
                         "status":"paper_blocked_unverified_contract_size" if paper else
                                  "signal_only_contract_size_unverified",
-                        "reason":"Quantity is not computed without a confirmed exchange lot increment and minimum order quantity."})
+                        "reason":"Quantity is not computed without a confirmed exchange lot increment and minimum order quantity.",
+                        "verification_errors":specs.get("verification_errors",[])})
                 output.append({"symbol":symbol,"status":"contract_size_unverified",
                     "profile":profile.as_dict(),"regime":regime.regime.value,
                     "indicators":diagnostics,"spread_pct":spread,"funding_rate":funding,
@@ -212,7 +232,7 @@ def scan_once(symbols, paper=False, config=None):
         except (MarketDataError,ValueError,KeyError) as exc:
             output.append({"symbol":symbol,"status":"data_or_signal_error","reason":str(exc)})
     return {"mode":"PAPER_ONLY" if paper else "SIGNAL_ONLY","exchange":"Delta Exchange India",
-        "account_balance":broker.balance,"account_equity":broker.equity(),
+        "account_balance":broker.balance,"account_equity":broker.equity(_current_paper_marks(broker.state["positions"],tickers)),
         "open_paper_positions":len(broker.state["positions"]),
         "pending_paper_entries":len(broker.state["pending"]),"results":output}
 

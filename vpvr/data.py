@@ -1,6 +1,7 @@
 """Delta India public REST market data. No private account or order functions are exposed."""
 from __future__ import annotations
 import time
+from decimal import Decimal, InvalidOperation
 import requests
 import pandas as pd
 from .config import VPVRConfig
@@ -190,35 +191,122 @@ class DeltaMarketData:
                 return False, "candle gap detected in supplied lookback"
         return True, "fresh"
 
+
     def contract_specs(self, product):
-        """Read product metadata. Unpublished size increments remain unverified paper assumptions."""
-        def number(key):
-            try:
-                value = float(product[key])
-                return value if value > 0 else None
-            except (KeyError, TypeError, ValueError):
+        """Normalize and verify supported Delta India perpetual contract sizing.
+
+        Delta order size is an integer number of contracts. The minimum
+        underlying-asset order sizes below come from Delta India's published
+        futures minimum-order guidance; they are converted to contract units
+        using the live product contract_value. Unknown products fail closed.
+        """
+        policies = {
+            "BTCUSD": {
+                "currency": "BTC",
+                "contract_value": Decimal("0.001"),
+                "minimum_underlying_qty": Decimal("0.001"),
+            },
+            "ETHUSD": {
+                "currency": "ETH",
+                "contract_value": Decimal("0.01"),
+                "minimum_underlying_qty": Decimal("0.01"),
+            },
+        }
+        metadata_keys = (
+            "symbol", "contract_type", "state", "trading_status",
+            "notional_type", "is_quanto", "contract_value",
+            "contract_unit_currency", "tick_size", "position_size_limit",
+        )
+        metadata = {key: product.get(key) for key in metadata_keys}
+        symbol = str(product.get("symbol") or "").upper()
+        policy = policies.get(symbol)
+        errors = []
+
+        def decimal_field(key):
+            raw = product.get(key)
+            if raw is None:
                 return None
-        multiplier = number("contract_value")
-        tick = number("tick_size")
-        lot = number("lot_size") or 1.0
-        minimum = number("minimum_order_size") or number("min_order_size") or 1.0
-        if product.get("is_quanto") is True or product.get("notional_type") not in (None, "vanilla"):
-            return None
-        if multiplier is None or tick is None:
-            return None
+            try:
+                value = Decimal(str(raw))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+            return value if value.is_finite() else None
+
+        multiplier = decimal_field("contract_value")
+        tick = decimal_field("tick_size")
+        limit = decimal_field("position_size_limit")
+        lot_increment = Decimal("1")
+        minimum_contracts = None
+
+        if policy is None:
+            errors.append("unsupported_symbol: no verified BTCUSD/ETHUSD sizing policy")
+        if not symbol or product.get("symbol") != symbol:
+            errors.append("symbol_mismatch_or_missing")
+        if product.get("contract_type") != "perpetual_futures":
+            errors.append("contract_type_must_be_perpetual_futures")
+        if product.get("state") != "live":
+            errors.append("product_state_must_be_live")
         if product.get("trading_status") != "operational":
-            return None
-        lot_increment_verified = product.get("lot_size") is not None
-        minimum_verified = (product.get("minimum_order_size") is not None or
-                            product.get("min_order_size") is not None)
+            errors.append("trading_status_must_be_operational")
+        if product.get("notional_type") != "vanilla":
+            errors.append("notional_type_must_be_vanilla")
+        if product.get("is_quanto") is not False:
+            errors.append("is_quanto_must_be_explicit_false")
+
+        if multiplier is None or multiplier <= 0:
+            errors.append("contract_value_missing_or_invalid")
+        if tick is None or tick <= 0:
+            errors.append("tick_size_missing_or_invalid")
+        if limit is None or limit <= 0 or limit != limit.to_integral_value():
+            errors.append("position_size_limit_missing_or_not_positive_integer")
+
+        if policy is not None:
+            if multiplier is None or multiplier != policy["contract_value"]:
+                errors.append("contract_value_does_not_match_published_symbol_policy")
+            if str(product.get("contract_unit_currency") or "").upper() != policy["currency"]:
+                errors.append("contract_unit_currency_does_not_match_symbol_policy")
+            if multiplier is not None and multiplier > 0:
+                raw_contracts = policy["minimum_underlying_qty"] / multiplier
+                if raw_contracts <= 0 or raw_contracts != raw_contracts.to_integral_value():
+                    errors.append("minimum_underlying_quantity_does_not_convert_to_integer_contracts")
+                else:
+                    minimum_contracts = int(raw_contracts)
+            else:
+                errors.append("minimum_order_cannot_be_normalized_without_contract_value")
+
+        lot_increment_verified = policy is not None
+        minimum_verified = (
+            policy is not None
+            and minimum_contracts is not None
+            and multiplier == policy["contract_value"]
+            and str(product.get("contract_unit_currency") or "").upper() == policy["currency"]
+        )
+        if not lot_increment_verified:
+            errors.append("integer_contract_increment_not_verified_for_symbol")
+
+        verified = not errors
         return {
-            "contract_multiplier": multiplier, "tick_size": tick,
-            "lot_size": lot, "min_qty": minimum,
-            "spec_verified": bool(lot_increment_verified and minimum_verified),
+            "symbol": symbol or None,
+            "contract_multiplier": float(multiplier) if multiplier is not None and multiplier > 0 else None,
+            "contract_unit_currency": product.get("contract_unit_currency"),
+            "tick_size": float(tick) if tick is not None and tick > 0 else None,
+            "lot_size": int(lot_increment) if lot_increment_verified else None,
+            "min_qty": minimum_contracts,
+            "minimum_underlying_qty": str(policy["minimum_underlying_qty"]) if policy is not None else None,
+            "minimum_order_contracts": minimum_contracts,
+            "position_size_limit": int(limit) if limit is not None and limit > 0 and limit == limit.to_integral_value() else None,
+            "max_order_size_contracts": int(limit) if limit is not None and limit > 0 and limit == limit.to_integral_value() else None,
+            "spec_verified": verified,
             "lot_increment_verified": lot_increment_verified,
             "minimum_quantity_verified": minimum_verified,
-            "position_size_limit": number("position_size_limit"),
-            "sizing_assumption": None if lot_increment_verified and minimum_verified else
-                "Delta public product metadata does not publish all lot/minimum fields; "
-                "paper sizing uses a 1-contract step/minimum assumption."
+            "verification_policy": "delta_india_btc_eth_minimums_v1" if policy is not None else None,
+            "verification_source": {
+                "minimum_order_guidance": "https://deltaexchangeindia.freshdesk.com/support/solutions/articles/80001132372-what-is-the-minimum-order-size-for-futures-trading-",
+                "product_metadata_and_order_size_schema": "https://docs.delta.exchange/",
+                "minimum_size_basis": "published minimum underlying-asset quantity divided by live contract_value",
+                "increment_basis": "Delta order size is an integer number of contracts",
+            } if policy is not None else None,
+            "metadata_received": metadata,
+            "verification_errors": errors,
+            "sizing_assumption": None if verified else "Contract sizing is unverified; this symbol must remain blocked from paper entries.",
         }
