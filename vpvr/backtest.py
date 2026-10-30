@@ -52,16 +52,37 @@ def _completed_1m_history(candles, current_index):
     """Only candles strictly before current_index are completed at its open."""
     return candles.iloc[:current_index].copy()
 
-def _quantity(equity, entry, stop, direction, multiplier, cfg):
+def _quantity(equity, entry, stop, direction, multiplier, cfg,
+              lot_size=1.0, min_qty=1.0, tick_size=None, position_size_limit=None):
+    """Return risk-sized quantity and a conservatively tick-rounded protective stop."""
+    if (equity <= 0 or multiplier <= 0 or lot_size <= 0 or min_qty <= 0 or
+            (tick_size is not None and tick_size <= 0)):
+        return 0.0, float(stop)
+    if tick_size is not None:
+        # Round away from entry so the sizing model never understates stop distance.
+        if direction == "LONG":
+            stop = math.floor(stop / tick_size + 1e-12) * tick_size
+        else:
+            stop = math.ceil(stop / tick_size - 1e-12) * tick_size
     distance = entry-stop if direction=="LONG" else stop-entry
-    if distance<=0 or equity<=0 or multiplier<=0:
-        return 0.0
+    if distance <= 0:
+        return 0.0, float(stop)
     unit_risk=(distance + entry*(2*cfg.fee_rate + 2*cfg.slippage_bps/10000))*multiplier
-    qty=math.floor((equity*cfg.risk_per_trade_pct/unit_risk)*1e6)/1e6
+    if unit_risk <= 0:
+        return 0.0, float(stop)
+    risk_qty=(equity*cfg.risk_per_trade_pct)/unit_risk
+    qty=math.floor((risk_qty/lot_size)+1e-12)*lot_size
     max_notional=equity*cfg.leverage*0.9
-    if qty*entry*multiplier>max_notional:
-        qty=math.floor((max_notional/(entry*multiplier))*1e6)/1e6
-    return max(0.0,qty)
+    leverage_qty=math.floor((max_notional/(entry*multiplier)/lot_size)+1e-12)*lot_size
+    qty=min(qty,leverage_qty)
+    if position_size_limit is not None:
+        if position_size_limit <= 0:
+            return 0.0, float(stop)
+        exchange_qty=math.floor((position_size_limit/lot_size)+1e-12)*lot_size
+        qty=min(qty,exchange_qty)
+    if qty+1e-12 < min_qty:
+        return 0.0, float(stop)
+    return float(qty), float(stop)
 
 def _metrics(start, trades, equity_curve):
     pnl=np.array([t["net_pnl"] for t in trades],dtype=float)
@@ -103,8 +124,10 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
     c1,c3,c15=_clean(candles_1m,1),_clean(candles_3m,3),_clean(candles_15m,15)
     if min(len(c1),len(c3),len(c15))<35:
         raise ValueError("insufficient candles for EMA/profile warm-up")
-    if contract_multiplier<=0:
-        raise ValueError("contract multiplier must be positive")
+    if (contract_multiplier<=0 or lot_size<=0 or min_qty<=0 or
+            (tick_size is not None and tick_size<=0) or
+            (position_size_limit is not None and position_size_limit<=0)):
+        raise ValueError("invalid contract multiplier, lot, minimum quantity, tick or position-size limit")
     equity=cfg.initial_balance
     pending=position=None
     trades=[];equity_curve=[equity]
@@ -202,7 +225,8 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                 elif trigger:
                     reference=max(sig.entry,bar["open"]) if direction=="LONG" else min(sig.entry,bar["open"])
                     fill=reference*(1+cfg.slippage_bps/10000 if direction=="LONG" else 1-cfg.slippage_bps/10000)
-                    qty=_quantity(equity,fill,sig.stop_loss,direction,contract_multiplier,cfg)
+                    qty,rounded_stop=_quantity(equity,fill,sig.stop_loss,direction,
+                        contract_multiplier,cfg,lot_size,min_qty,tick_size,position_size_limit)
                     if equity<=daily_start*(1-cfg.daily_loss_limit_pct):
                         qty=0.0;skipped["daily_loss_lockout"]+=1
                     if consecutive_losses>=cfg.max_consecutive_losses:
@@ -210,7 +234,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                     if qty>0:
                         fee=abs(fill*qty*contract_multiplier)*cfg.fee_rate;equity-=fee
                         position={"symbol":symbol,"strategy":sig.strategy,"direction":direction,"entry":fill,
-                            "stop":sig.stop_loss,"targets":list(sig.targets[:3]),"quantity":qty,"remaining":qty,
+                            "stop":rounded_stop,"targets":list(sig.targets[:3]),"quantity":qty,"remaining":qty,
                             "opened_at":ts.isoformat(),"target_index":0,"gross_pnl":0.0,"fees":fee,"net_pnl":-fee,
                             "last_candle_low":bar["low"],"last_candle_high":bar["high"],"regime":pending["regime"]}
 
@@ -259,7 +283,10 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
         sub=[t for t in trades if t["strategy"]==name];curve=[cfg.initial_balance]
         for trade in sub:curve.append(curve[-1]+trade["net_pnl"])
         by_strategy[name]=_metrics(cfg.initial_balance,sub,curve)
-    return {"symbol":symbol,"config":asdict(cfg),"metrics":metrics,"strategy_metrics":by_strategy,
+    return {"symbol":symbol,"config":asdict(cfg),
+        "contract_specs":{"contract_multiplier":contract_multiplier,"lot_size":lot_size,
+            "min_qty":min_qty,"tick_size":tick_size,"position_size_limit":position_size_limit},
+        "metrics":metrics,"strategy_metrics":by_strategy,
         "signals_detected":dict(signal_counts),"skipped":dict(skipped),"trades":trades,
         "equity_curve":equity_curve,"open_position_at_end":position,"pending_signal_at_end":pending,
         "limitations":["Volume Profile from historical OHLCV is a range-volume approximation, not historical trade-level volume-at-price.",
