@@ -113,7 +113,9 @@ def _metrics(start, trades, equity_curve):
         "average_holding_minutes":float(np.mean([t["holding_minutes"] for t in trades])) if trades else 0.0,
         "ending_equity":equity_curve[-1]}
 
-def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_multiplier=1.0):
+def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,
+                 contract_multiplier=1.0,lot_size=1.0,min_qty=1.0,tick_size=None,
+                 position_size_limit=None):
     """Run one symbol chronologically. Stops win when stop/target both touch in one 1m bar.
 
     Signals queue a trigger for a later 1m bar. Profiles from historical candles
