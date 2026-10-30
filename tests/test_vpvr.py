@@ -2,6 +2,7 @@
 from __future__ import annotations
 import tempfile
 import unittest
+import json
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from vpvr.risk import RiskEngine
 from vpvr.strategies import StrategySignal, _make
 from vpvr.paper import PaperBroker
 from vpvr.data import DeltaMarketData
+from vpvr.stream import DeltaPublicStream
 from vpvr.backtest import BacktestConfig, run_backtest, _completed_1m_history
 
 
@@ -197,6 +199,31 @@ class DataTests(unittest.TestCase):
         self.assertTrue(data.freshness(good,"1m",now=now)[0])
         gap=pd.DataFrame({"time":pd.to_datetime(["2026-01-01T00:00:00Z","2026-01-01T00:02:00Z"],utc=True)})
         self.assertFalse(data.freshness(gap,"1m",now=now)[0])
+
+
+class StreamTests(unittest.TestCase):
+    def test_compact_ticker_payload_resolves_symbol_and_l1_quotes(self):
+        stream=DeltaPublicStream(["BTCUSD"])
+        payload={"type":"ticker","d":[{"s":"BTCUSD","m":"100.5",
+            "q":["100.6","2.0","100.4","3.0"],"to":[0,12345]}]}
+        stream._on_message(None,json.dumps(payload))
+        events=stream.snapshot("BTCUSD")
+        self.assertEqual(len(events),1)
+        self.assertEqual(events[0]["best_ask"],100.6)
+        self.assertEqual(events[0]["best_bid"],100.4)
+        self.assertEqual(events[0]["mark_price"],100.5)
+
+    def test_stream_uses_singular_candlestick_channel_and_keeps_taker_opaque(self):
+        stream=DeltaPublicStream(["BTCUSD"])
+        channels=[item["name"] for item in stream.subscription()["payload"]["channels"]]
+        self.assertIn("candlestick_1m",channels)
+        self.assertNotIn("candlesticks_1m",channels)
+        trade={"type":"trades","sy":"BTCUSD","p":"100","s":"2",
+               "r":"taker","t":1767225600000000,"ts":1767225600001000}
+        stream._on_message(None,json.dumps(trade))
+        event=stream.snapshot("BTCUSD")[0]
+        self.assertEqual(event["buyer_role"],"taker")
+        self.assertIsNone(event["aggressor_side"])
 
 
 class BacktestTests(unittest.TestCase):
