@@ -161,6 +161,7 @@ class PaperBroker:
                 return events
 
             targets = position["targets"]
+            target_index_before = position["target_index"]
             fractions = [1.0] if len(targets) == 1 else ([0.30, 0.45] if len(targets) == 2 else [0.30, 0.45, 0.25])
             while position["target_index"] < len(targets):
                 index = position["target_index"]
@@ -185,6 +186,19 @@ class PaperBroker:
                     position["stop"] = float(targets[0])
                 events.append({"symbol": symbol, "event": "partial_target", "target": target,
                                "quantity": qty, "net_pnl": net})
+            # A partial target can tighten the stop inside this same OHLC candle.
+            # If the candle also crosses that new stop, resolve the ambiguity
+            # conservatively instead of allowing the runner to survive on hindsight.
+            if position["remaining"] > 1e-10 and position["target_index"] > target_index_before:
+                tightened_stop_hit = (low <= position["stop"] if direction == "LONG"
+                                      else high >= position["stop"])
+                if tightened_stop_hit:
+                    fill = position["stop"] * (1 - self.slippage_bps / 10000 if direction == "LONG"
+                                                else 1 + self.slippage_bps / 10000)
+                    self._close(symbol, fill, "SAME_BAR_TIGHTENED_STOP", timestamp, events)
+                    self._save()
+                    return events
+
             if position["remaining"] <= 1e-10:
                 self._finish(symbol, timestamp, float(targets[-1]), "TARGETS")
                 events.append({"symbol": symbol, "event": "closed", "reason": "TARGETS"})
