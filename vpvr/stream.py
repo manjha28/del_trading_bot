@@ -77,6 +77,7 @@ class DeltaPublicStream:
             rows = data.get("d") or []
             row = next((item for item in rows if item.get("s") == symbol), rows[0] if rows else {})
             if row:
+                symbol = row.get("s") or symbol
                 quote = row.get("q") or []
                 if len(quote) >= 4:
                     data = {**data, "best_ask": quote[0], "best_bid": quote[2],
