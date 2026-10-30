@@ -68,8 +68,9 @@ def scan_once(
                     "signals": [],
                 }
                 store.record_observation(product_id, observation)
+                cached_hourly = store.load_candles(product_id, "1h", 60 * 24 + 24)
                 store.update_signal_outcomes(
-                    product_id, frames["1h"], now=now.isoformat()
+                    product_id, cached_hourly, now=now.isoformat()
                 )
                 observations.append(observation)
                 continue
@@ -153,6 +154,7 @@ def scan_once(
             if issues or ticker_error:
                 observation["data_quality"]["confidence"] *= 0.75
             store.record_observation(product_id, observation)
+            store.update_signal_outcomes(product_id, frames["1h"], now=now.isoformat())
             observations.append(observation)
             logger.info("%s: %s, sleeping=%s, execution=%s", symbol, observation["state"],
                         observation.get("sleeping_score"), observation["execution"]["eligible"])
