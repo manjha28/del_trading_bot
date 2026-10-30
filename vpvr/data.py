@@ -158,8 +158,10 @@ class DeltaMarketData:
                 return None
         multiplier = number("contract_value")
         tick = number("tick_size")
-        lot = number("lot_size") or 1.0
-        minimum = number("minimum_order_size") or number("min_order_size") or 1.0
+        actual_lot = number("lot_size")
+        actual_minimum = number("minimum_order_size") or number("min_order_size")
+        lot = actual_lot or 1.0
+        minimum = actual_minimum or 1.0
         if product.get("is_quanto") is True or product.get("notional_type") not in (None, "vanilla"):
             return None
         if multiplier is None or tick is None:
@@ -169,7 +171,6 @@ class DeltaMarketData:
         return {
             "contract_multiplier": multiplier, "tick_size": tick,
             "lot_size": lot, "min_qty": minimum,
-            "spec_verified": bool(product.get("minimum_order_size") or
-                                  product.get("min_order_size") or product.get("lot_size")),
+            "spec_verified": actual_lot is not None and actual_minimum is not None,
             "position_size_limit": number("position_size_limit")
         }
