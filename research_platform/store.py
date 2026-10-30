@@ -731,14 +731,21 @@ class ResearchDataStore:
 
         def execution_config(config: dict) -> dict:
             nested = config.get("portfolio", {})
+            defaults = {
+                "trade_latency_seconds": 0.0,
+                "max_daily_realized_loss_pct": 0.02,
+                "max_realized_drawdown_pct": 0.10,
+            }
             return {
-                key: config.get(key, nested.get(key))
+                key: config.get(key, nested.get(key, defaults.get(key)))
                 for key in (
                     "initial_equity", "max_open_positions",
                     "max_portfolio_risk_pct", "max_gross_leverage",
                     "max_pairwise_correlation", "correlation_lookback_minutes",
                     "minimum_correlation_observations", "trade_risk_pct",
                     "trade_leverage", "fee_rate", "spread_bps", "slippage_bps",
+                    "trade_latency_seconds", "max_daily_realized_loss_pct",
+                    "max_realized_drawdown_pct",
                 )
             }
 
@@ -855,6 +862,9 @@ class ResearchDataStore:
                         "max_pairwise_correlation", "correlation_lookback_minutes",
                         "minimum_correlation_observations", "trade_risk_pct",
                         "trade_leverage", "fee_rate", "spread_bps", "slippage_bps",
+                        "trade_latency_seconds",
+                        "max_daily_realized_loss_pct",
+                        "max_realized_drawdown_pct",
                     )
                 )
                 comparison_entries.append({

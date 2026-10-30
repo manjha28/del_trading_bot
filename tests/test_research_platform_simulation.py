@@ -79,6 +79,24 @@ class PaperSimulatorTests(unittest.TestCase):
         self.assertGreater(result.fees, 0)
         self.assertEqual(result.equity_after, 10_000 + result.net_pnl)
 
+    def test_configured_latency_skips_candles_before_the_delay_expires(self):
+        decision = T0 + timedelta(minutes=1)
+        bars = [
+            candle(decision, 100, 105, 99, 104),
+            candle(decision + timedelta(minutes=1), 100, 111, 99, 110),
+        ]
+        simulator = PaperSimulator(PaperSimulationConfig(latency_seconds=60))
+        result = simulator.simulate(
+            signal(decision=decision), instrument(), bars, 10_000,
+        )
+        self.assertEqual(result.status, "simulated")
+        self.assertEqual(result.entry_time, (decision + timedelta(minutes=1)).isoformat())
+        self.assertTrue(any("delayed by 60s" in item for item in result.assumptions))
+
+    def test_execution_latency_must_be_non_negative(self):
+        with self.assertRaisesRegex(ValueError, "latency_seconds"):
+            PaperSimulationConfig(latency_seconds=-1)
+
     def test_fold_boundary_excludes_future_target_and_marks_open_trade(self):
         boundary = T0 + timedelta(minutes=2)
         bars = [

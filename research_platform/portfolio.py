@@ -20,13 +20,16 @@ class PortfolioSimulationConfig:
     max_pairwise_correlation: float = 0.8
     correlation_lookback_minutes: int = 60
     minimum_correlation_observations: int = 30
+    max_daily_realized_loss_pct: float = 0.02
+    max_realized_drawdown_pct: float = 0.10
 
     def __post_init__(self) -> None:
         if self.max_open_positions < 1:
             raise ValueError("max_open_positions must be positive")
         for name in (
             "max_portfolio_risk_pct", "max_gross_leverage",
-            "max_pairwise_correlation",
+            "max_pairwise_correlation", "max_daily_realized_loss_pct",
+            "max_realized_drawdown_pct",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
@@ -41,6 +44,10 @@ class PortfolioSimulationConfig:
             raise ValueError("max_portfolio_risk_pct cannot exceed 2%")
         if self.max_gross_leverage > 20:
             raise ValueError("max_gross_leverage cannot exceed 20x")
+        if self.max_daily_realized_loss_pct > 0.2:
+            raise ValueError("max_daily_realized_loss_pct cannot exceed 20%")
+        if self.max_realized_drawdown_pct > 0.5:
+            raise ValueError("max_realized_drawdown_pct cannot exceed 50%")
 
 
 @dataclass(frozen=True)
@@ -108,6 +115,8 @@ class PortfolioPaperSimulator:
         active: list[tuple[PaperTradeResult, float, float]] = []
         equity = float(initial_equity)
         equity_marks = [equity]
+        daily_start_equity = {}
+        daily_realized_pnl = {}
         max_concurrent = 0
 
         def settle(cutoff: datetime) -> None:
@@ -120,6 +129,13 @@ class PortfolioPaperSimulator:
             for item in due:
                 result, _, _ = item
                 before = equity
+                exit_day = datetime.fromisoformat(
+                    result.exit_time
+                ).astimezone(timezone.utc).date()
+                daily_start_equity.setdefault(exit_day, equity)
+                daily_realized_pnl[exit_day] = (
+                    daily_realized_pnl.get(exit_day, 0.0) + result.net_pnl
+                )
                 equity += result.net_pnl
                 settled = replace(result, equity_before=before, equity_after=equity)
                 for index, existing in enumerate(outcomes):
@@ -137,12 +153,31 @@ class PortfolioPaperSimulator:
         for _, signal in ordered:
             decision = signal.decision_time
             settle(decision)
+            decision_day = decision.astimezone(timezone.utc).date()
+            daily_start_equity.setdefault(decision_day, equity)
 
             identity = (signal.strategy_id, signal.product_id, decision.isoformat())
             if identity in seen:
                 outcomes.append(self._reject(signal, equity, "duplicate signal identity"))
                 continue
             seen.add(identity)
+            daily_limit = (
+                daily_start_equity[decision_day]
+                * self.config.max_daily_realized_loss_pct
+            )
+            if daily_realized_pnl.get(decision_day, 0.0) <= -daily_limit:
+                outcomes.append(self._reject(
+                    signal, equity, "maximum daily realized loss exceeded"
+                ))
+                continue
+            peak_equity = max(equity_marks)
+            if peak_equity > 0 and (
+                peak_equity - equity
+            ) / peak_equity >= self.config.max_realized_drawdown_pct:
+                outcomes.append(self._reject(
+                    signal, equity, "maximum realized portfolio drawdown exceeded"
+                ))
+                continue
             instrument = instruments.get(signal.product_id)
             bars = candles_by_product.get(signal.product_id)
             if instrument is None or bars is None:
@@ -221,11 +256,14 @@ class PortfolioPaperSimulator:
                 "max_gross_leverage": self.config.max_gross_leverage,
                 "max_pairwise_correlation": self.config.max_pairwise_correlation,
                 "correlation_lookback_minutes": self.config.correlation_lookback_minutes,
+                "max_daily_realized_loss_pct": self.config.max_daily_realized_loss_pct,
+                "max_realized_drawdown_pct": self.config.max_realized_drawdown_pct,
                 "per_trade_risk_pct": self.trade_config.risk_per_trade_pct,
             },
             limitations=(
-                "Positions are filled with the single-trade OHLCV simulator; partial fills and market impact are absent.",
+                "Positions use candle-level latency plus the single-trade OHLCV simulator; sub-candle latency, partial fills, and market impact are absent.",
                 "Funding cash flows, maintenance margin, liquidation, and correlation stress outside the recent aligned-return gate are not modeled.",
+                "Daily loss and drawdown gates use realized equity only; intratrade mark-to-market risk is not modeled.",
                 "Signals are processed chronologically and overlapping same-product positions are rejected.",
             ),
         )

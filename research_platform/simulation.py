@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 from typing import Iterable
 
@@ -16,6 +16,7 @@ class PaperSimulationConfig:
     fee_rate: float = 0.0005
     spread_bps: float = 5.0
     slippage_bps: float = 2.0
+    latency_seconds: float = 0.0
     max_holding_candles: int = 100
 
     def __post_init__(self) -> None:
@@ -23,7 +24,7 @@ class PaperSimulationConfig:
             raise ValueError("risk_per_trade_pct must be in (0, 0.02]")
         if not math.isfinite(self.leverage) or not 1 <= self.leverage <= 20:
             raise ValueError("leverage must be in [1, 20]")
-        for name in ("fee_rate", "spread_bps", "slippage_bps"):
+        for name in ("fee_rate", "spread_bps", "slippage_bps", "latency_seconds"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
@@ -100,9 +101,12 @@ class PaperSimulator:
             return self._rejected(signal, equity, "incomplete candle supplied to simulator")
         if any(a.start_time >= b.start_time for a, b in zip(bars, bars[1:])):
             return self._rejected(signal, equity, "candles must be strictly chronological and unique")
+        entry_after = signal.decision_time.astimezone(timezone.utc) + timedelta(
+            seconds=self.config.latency_seconds
+        )
         future = [
             bar for bar in bars
-            if bar.start_time >= signal.decision_time
+            if bar.start_time >= entry_after
             and (max_exit_time is None or bar.close_time <= max_exit_time)
         ]
         if not future:
@@ -241,7 +245,14 @@ class PaperSimulator:
         fees = fee_notional * self.config.fee_rate
         net = gross - fees
         assumptions = (
-            "entry at first candle open at or after signal decision time unless signal supplies a price",
+            (
+                "entry at first candle open at or after signal decision time"
+                if self.config.latency_seconds == 0
+                else (
+                    f"entry delayed by {self.config.latency_seconds:g}s and filled "
+                    "at the first eligible candle open; sub-candle latency cannot be resolved"
+                )
+            ),
             "fixed spread and slippage applied adversely to entry and exit",
             "fees charged on entry and exit notional",
             "stop takes precedence when stop and target both touch in one OHLCV candle",

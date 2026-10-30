@@ -294,12 +294,15 @@ def _backtest(args) -> int:
                 max_pairwise_correlation=args.max_pairwise_correlation,
                 correlation_lookback_minutes=args.correlation_lookback_minutes,
                 minimum_correlation_observations=args.minimum_correlation_observations,
+                max_daily_realized_loss_pct=args.max_daily_realized_loss_pct,
+                max_realized_drawdown_pct=args.max_realized_drawdown_pct,
                 trade=PaperSimulationConfig(
                     risk_per_trade_pct=args.trade_risk_pct,
                     leverage=max(1.0, args.max_gross_leverage),
                     fee_rate=args.fee_rate,
                     spread_bps=args.spread_bps,
                     slippage_bps=args.slippage_bps,
+                    latency_seconds=args.latency_seconds,
                 ),
             ),
         )
@@ -340,11 +343,14 @@ def _backtest(args) -> int:
                         "max_pairwise_correlation": args.max_pairwise_correlation,
                         "correlation_lookback_minutes": args.correlation_lookback_minutes,
                         "minimum_correlation_observations": args.minimum_correlation_observations,
+                        "max_daily_realized_loss_pct": args.max_daily_realized_loss_pct,
+                        "max_realized_drawdown_pct": args.max_realized_drawdown_pct,
                         "trade_risk_pct": args.trade_risk_pct,
                         "trade_leverage": max(1.0, args.max_gross_leverage),
                         "fee_rate": args.fee_rate,
                         "spread_bps": args.spread_bps,
                         "slippage_bps": args.slippage_bps,
+                        "trade_latency_seconds": args.latency_seconds,
                         "source_coverage": coverage,
                     },
                     metrics,
@@ -378,11 +384,14 @@ def _backtest(args) -> int:
                         "max_pairwise_correlation": args.max_pairwise_correlation,
                         "correlation_lookback_minutes": args.correlation_lookback_minutes,
                         "minimum_correlation_observations": args.minimum_correlation_observations,
+                        "max_daily_realized_loss_pct": args.max_daily_realized_loss_pct,
+                        "max_realized_drawdown_pct": args.max_realized_drawdown_pct,
                         "trade_risk_pct": args.trade_risk_pct,
                         "trade_leverage": max(1.0, args.max_gross_leverage),
                         "fee_rate": args.fee_rate,
                         "spread_bps": args.spread_bps,
                         "slippage_bps": args.slippage_bps,
+                        "trade_latency_seconds": args.latency_seconds,
                     },
                 },
                 {
@@ -447,12 +456,15 @@ def main(argv=None) -> int:
     backtest.add_argument("--max-portfolio-risk-pct", type=float, default=0.015)
     backtest.add_argument("--max-gross-leverage", type=float, default=2.0)
     backtest.add_argument("--max-pairwise-correlation", type=float, default=0.8)
+    backtest.add_argument("--max-daily-realized-loss-pct", type=float, default=0.02)
+    backtest.add_argument("--max-realized-drawdown-pct", type=float, default=0.10)
     backtest.add_argument("--correlation-lookback-minutes", type=int, default=60)
     backtest.add_argument("--minimum-correlation-observations", type=int, default=30)
     backtest.add_argument("--trade-risk-pct", type=float, default=0.005)
     backtest.add_argument("--fee-rate", type=float, default=0.0005)
     backtest.add_argument("--spread-bps", type=float, default=5.0)
     backtest.add_argument("--slippage-bps", type=float, default=2.0)
+    backtest.add_argument("--latency-seconds", type=float, default=0.0)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

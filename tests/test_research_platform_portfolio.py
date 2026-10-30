@@ -56,6 +56,25 @@ def bars(product_id, symbol, target=120):
     ]
 
 
+def loss_bars(product_id, symbol, count=12):
+    return [
+        Candle(
+            product_id,
+            symbol,
+            "1m",
+            T0 + timedelta(minutes=index),
+            100,
+            101,
+            94 if index % 2 else 99,
+            99,
+            10,
+            "fixture",
+            True,
+        )
+        for index in range(count)
+    ]
+
+
 def correlation_bars(product_id, symbol, return_pattern, exit_index=16):
     closes = [100.0]
     for value in return_pattern:
@@ -197,6 +216,50 @@ class PortfolioSimulationTests(unittest.TestCase):
         )
         self.assertEqual(result.accepted_count, 0)
         self.assertEqual(result.outcomes[0].reason, "maximum gross portfolio exposure exceeded")
+
+    def test_daily_realized_loss_limit_blocks_new_positions(self):
+        config = PortfolioSimulationConfig(
+            max_open_positions=1,
+            max_portfolio_risk_pct=0.02,
+            max_daily_realized_loss_pct=0.02,
+            max_realized_drawdown_pct=0.10,
+            trade=PaperSimulationConfig(risk_per_trade_pct=0.02),
+        )
+        result = PortfolioPaperSimulator(config).simulate(
+            [
+                signal("1", "AAAUSD", T0),
+                signal("1", "AAAUSD", T0 + timedelta(minutes=2), "second"),
+                signal("1", "AAAUSD", T0 + timedelta(minutes=4), "third"),
+            ],
+            {"1": product("1", "AAAUSD")},
+            {"1": loss_bars("1", "AAAUSD")},
+            10_000,
+        )
+        self.assertEqual(result.accepted_count, 2)
+        rejected = [item for item in result.outcomes if item.status == "rejected"]
+        self.assertTrue(any("daily realized loss" in item.reason for item in rejected))
+
+    def test_realized_drawdown_limit_blocks_new_positions(self):
+        config = PortfolioSimulationConfig(
+            max_open_positions=1,
+            max_portfolio_risk_pct=0.02,
+            max_daily_realized_loss_pct=0.10,
+            max_realized_drawdown_pct=0.02,
+            trade=PaperSimulationConfig(risk_per_trade_pct=0.02),
+        )
+        result = PortfolioPaperSimulator(config).simulate(
+            [
+                signal("1", "AAAUSD", T0),
+                signal("1", "AAAUSD", T0 + timedelta(minutes=2), "second"),
+                signal("1", "AAAUSD", T0 + timedelta(minutes=4), "third"),
+            ],
+            {"1": product("1", "AAAUSD")},
+            {"1": loss_bars("1", "AAAUSD")},
+            10_000,
+        )
+        self.assertEqual(result.accepted_count, 2)
+        rejected = [item for item in result.outcomes if item.status == "rejected"]
+        self.assertTrue(any("realized portfolio drawdown" in item.reason for item in rejected))
 
     def test_duplicate_signal_identity_is_rejected(self):
         simulator = PortfolioPaperSimulator()
