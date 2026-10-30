@@ -132,9 +132,9 @@ class PaperTests(unittest.TestCase):
             broker.process_candle("BTCUSD",self.candle("2026-01-01T00:00:00Z",100,102,100,101))
             broker.process_candle("BTCUSD",self.candle("2026-01-01T00:01:00Z",100,102,100,101))
             events=broker.process_candle("BTCUSD",self.candle("2026-01-01T00:02:00Z",101,106,98,103))
-            self.assertTrue(any(e.get("reason")=="STOP" for e in events))
+            self.assertTrue(any(e.get("reason")=="STOP_OR_TRAIL" for e in events))
             self.assertNotIn("BTCUSD",broker.state["positions"])
-            self.assertEqual(broker.state["trades"][-1]["exit_reason"],"STOP")
+            self.assertEqual(broker.state["trades"][-1]["exit_reason"],"STOP_OR_TRAIL")
 
     def test_two_targets_leave_runner_and_trail_structurally(self):
         with tempfile.TemporaryDirectory() as directory:
