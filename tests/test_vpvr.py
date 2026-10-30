@@ -143,7 +143,7 @@ class PaperTests(unittest.TestCase):
             broker.queue_signal(self.signal(),1)
             broker.process_candle("BTCUSD",self.candle("2026-01-01T00:00:00Z",100,102,100,101))
             broker.process_candle("BTCUSD",self.candle("2026-01-01T00:01:00Z",100,102,100,101))
-            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:02:00Z",101,106,101,105))
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:02:00Z",101,106,102,105))
             broker.process_candle("BTCUSD",self.candle("2026-01-01T00:03:00Z",106,110,106,109))
             position=broker.state["positions"]["BTCUSD"]
             self.assertAlmostEqual(position["remaining"],.25)
