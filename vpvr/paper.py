@@ -183,6 +183,16 @@ class PaperBroker:
                     position["stop"] = float(targets[0])
                 events.append({"symbol": symbol, "event": "partial_target", "target": target,
                                "quantity": qty, "net_pnl": net})
+                # If this same OHLC bar also crosses the newly tightened stop,
+                # stop out the remaining size rather than assuming an optimistic path.
+                stop_after_target = (low <= position["stop"] if direction == "LONG"
+                                     else high >= position["stop"])
+                if position["remaining"] > 1e-10 and stop_after_target:
+                    stop_fill = position["stop"] * (1 - self.slippage_bps / 10000 if direction == "LONG"
+                                                     else 1 + self.slippage_bps / 10000)
+                    self._close(symbol, stop_fill, "SAME_BAR_TIGHTENED_STOP", timestamp, events)
+                    self._save()
+                    return events
             if position["remaining"] <= 1e-10:
                 self._finish(symbol, timestamp, float(targets[-1]), "TARGETS")
                 events.append({"symbol": symbol, "event": "closed", "reason": "TARGETS"})
