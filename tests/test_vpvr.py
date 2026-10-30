@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
@@ -14,7 +15,7 @@ from vpvr.risk import RiskEngine
 from vpvr.strategies import StrategySignal, _make
 from vpvr.paper import PaperBroker
 from vpvr.data import DeltaMarketData
-from vpvr.backtest import BacktestConfig, run_backtest
+from vpvr.backtest import BacktestConfig, run_backtest, _completed_1m_history
 
 
 class ProfileTests(unittest.TestCase):
@@ -45,6 +46,14 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):build_volume_profile(pd.DataFrame(),rows=49)
         empty=pd.DataFrame({"high":[1.],"low":[1.],"volume":[0.]})
         with self.assertRaises(ValueError):build_volume_profile(empty)
+
+    def test_profile_snapshot_exposes_volume_at_price_arrays(self):
+        candles=pd.DataFrame({"high":[101.],"low":[100.],"volume":[10.]})
+        profile=build_volume_profile(candles,rows=50)
+        snapshot=profile.as_dict()
+        self.assertEqual(len(snapshot["price_levels"]),50)
+        self.assertEqual(len(snapshot["volume_at_price"]),50)
+        self.assertAlmostEqual(sum(snapshot["volume_at_price"]),10.0)
 
 
 class IndicatorTests(unittest.TestCase):
@@ -103,6 +112,17 @@ class RiskTests(unittest.TestCase):
         self.assertFalse(decision.accepted)
         self.assertIn("daily equity drawdown",decision.reason)
 
+    def test_tick_rounding_never_moves_stop_toward_entry(self):
+        engine=RiskEngine(self.cfg);engine.reset_day(1000,date(2026,1,1))
+        long=engine.size(equity=1000,entry=100,stop=99.16,direction="LONG",
+            leverage=10,contract_multiplier=1,lot_size=1,min_qty=1,tick_size=0.1)
+        short=engine.size(equity=1000,entry=100,stop=100.84,direction="SHORT",
+            leverage=10,contract_multiplier=1,lot_size=1,min_qty=1,tick_size=0.1)
+        self.assertTrue(long.accepted,long.reason)
+        self.assertTrue(short.accepted,short.reason)
+        self.assertEqual(long.quantity,4)
+        self.assertEqual(short.quantity,4)
+
 
 class PaperTests(unittest.TestCase):
     def signal(self):
@@ -141,8 +161,35 @@ class PaperTests(unittest.TestCase):
             path=Path(directory)/"paper.json";path.write_text("{broken")
             with self.assertRaises(RuntimeError):PaperBroker(path)
 
+    def test_funding_requires_an_explicit_timestamped_settlement_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker=PaperBroker(Path(directory)/"paper.json",initial_balance=1000,
+                fee_rate=0,slippage_bps=0)
+            broker.queue_signal(self.signal(),1)
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:00:00Z",100,102,100,101))
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:01:00Z",100,102,100,101))
+            before=broker.balance
+            # A bare rate is not a funding settlement and cannot change cash.
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:02:00Z",101,102,100,101.5))
+            self.assertAlmostEqual(broker.balance,before)
+            # A real timestamped event within the 1m bar is charged once.
+            event={"timestamp":"2026-01-01T00:03:30Z","rate":0.001,"source":"test"}
+            events=broker.process_candle("BTCUSD",self.candle("2026-01-01T00:03:00Z",101,102,100,101.5),
+                funding_event=event)
+            self.assertTrue(any(e["event"]=="funding" for e in events))
+            self.assertLess(broker.balance,before)
+
 
 class DataTests(unittest.TestCase):
+    def test_public_trade_loader_preserves_identical_distinct_execution_rows(self):
+        data=DeltaMarketData(config=VPVRConfig())
+        duplicate={"price":100.0,"size":2.0,"side":"buy","timestamp":1767225600000000}
+        payload={"result":{"trades":[duplicate.copy(),duplicate.copy()]}}
+        with patch.object(data,"_get_json",return_value=payload):
+            trades=data.fetch_public_trades("BTCUSD")
+        self.assertEqual(len(trades),2)
+        self.assertEqual(float(trades.volume.sum()),4.0)
+
     def test_freshness_detects_gaps(self):
         data=DeltaMarketData(config=VPVRConfig())
         now=pd.Timestamp("2026-01-01T00:03:00Z").timestamp()
@@ -153,6 +200,22 @@ class DataTests(unittest.TestCase):
 
 
 class BacktestTests(unittest.TestCase):
+    def test_completed_history_excludes_current_forming_1m_bar(self):
+        frame=pd.DataFrame({"time":pd.date_range("2026-01-01",periods=4,freq="1min",tz="UTC")})
+        history=_completed_1m_history(frame,3)
+        self.assertEqual(len(history),3)
+        self.assertLess(history.time.max(),frame.time.iloc[3])
+
+    def test_backtest_rejects_gapped_timeframes(self):
+        base=pd.Timestamp("2026-01-01T00:00:00Z")
+        def frame(count,minutes):
+            times=[base+pd.Timedelta(minutes=minutes*i) for i in range(count)]
+            return pd.DataFrame({"time":times,"open":[100.]*count,"high":[100.2]*count,
+                "low":[99.8]*count,"close":[100.]*count,"volume":[10.]*count})
+        broken=frame(600,1).drop(index=[200]).reset_index(drop=True)
+        with self.assertRaisesRegex(ValueError,"gaps"):
+            run_backtest("BTCUSD",broken,frame(200,3),frame(40,15),BacktestConfig())
+
     def test_backtest_runs_without_trades_on_flat_data(self):
         base=pd.Timestamp("2026-01-01T00:00:00Z")
         def frame(count,minutes):
