@@ -20,7 +20,7 @@ Relevant variables:
 - `VPVR_RISK_PER_TRADE_PCT` (0.0025–0.005), `VPVR_DAILY_LOSS_LIMIT_PCT` (max 0.015)
 - `VPVR_MAX_CONSECUTIVE_LOSSES`, `VPVR_MIN_REWARD_RISK` (at least 2)
 - `VPVR_DEFAULT_LEVERAGE` (default 10, maximum 20), `VPVR_MAX_POSITIONS`
-- `VPVR_MAX_DATA_AGE_SECONDS`, `VPVR_MAX_SPREAD_PCT`, `VPVR_MIN_VOLUME_MULTIPLE`
+- `VPVR_MAX_DATA_AGE_SECONDS`, `VPVR_MAX_SPREAD_PCT`, `VPVR_MAX_ABS_FUNDING_RATE`, `VPVR_MIN_VOLUME_MULTIPLE`
 - `VPVR_PAPER_BALANCE`, `VPVR_FEE_RATE`, `VPVR_SLIPPAGE_BPS`
 - `VPVR_PROFILE_LOOKBACK_15M`, `VPVR_PAPER_STATE_FILE`
 
@@ -68,8 +68,8 @@ Paper-state JSON is stored under `data/` by default and is ignored by Git. Do no
 - Session VWAP currently resets at UTC midnight. Configure a different session definition before using it for non-UTC exchange sessions.
 
 ## Data limitations and operational cautions
-- Delta product metadata may omit lot increments/minimum quantities. The paper adapter marks a 1-contract fallback as unverified. This is a simulation assumption only and must never be reused for live sizing.
-- Order-book depth, spreads, funding-rate quotes and public trade prints are diagnostics. The paper broker charges funding only when supplied an explicit timestamped funding-settlement event; a rate quote alone does not prove settlement and is not accrued. The REST polling loop currently reports the funding rate but does not source settlement events, so its paper PnL does not include funding. Historical funding is not included in the first backtest engine.
+- Paper execution is blocked unless Delta reports an operational product with verified lot increment and minimum quantity. Signal-only scans may show signals without computing a position quantity when size metadata is missing. The paper adapter retains a 1-contract fallback solely for diagnostics and never uses it to queue paper positions.
+- The entry filter reads Delta's public `FUNDING:<symbol>` candle history and fails closed when the latest rate is unavailable/stale or exceeds `VPVR_MAX_ABS_FUNDING_RATE`. Funding is an entry filter only. The paper broker charges funding only when supplied an explicit timestamped funding-settlement event; the REST polling loop does not source settlement events, so paper PnL does not include funding. Historical funding is not included in the first backtest engine.
 - The backtester assumes stop-first if stop and target touch in the same 1m candle, includes configured fees/slippage, and cannot model queue position or partial exchange fills.
 - Candle API history is chunked for backfill. Gaps, stale bars, incomplete bars, unknown contract multiplier/tick, missing spread quotes, or failed API requests cause no-trade behavior.
 - A paper result is not a profitability claim. Validate out-of-sample, per-symbol, per-regime and after realistic fees before considering any separate live execution project.
