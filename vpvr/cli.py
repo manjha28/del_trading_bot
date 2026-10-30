@@ -54,7 +54,7 @@ def _restore_risk(engine, broker, today):
     key=today.isoformat()
     if state.get("risk_day")!=key:
         state["risk_day"]=key
-        state["risk_day_start_equity"]=broker.balance
+        state["risk_day_start_equity"]=broker.equity()
         broker._save()
     engine.reset_day(float(state["risk_day_start_equity"]),today)
     closed=sorted(state.get("trades",[]),key=lambda row:row.get("closed_at",""))
@@ -137,7 +137,19 @@ def scan_once(symbols, paper=False, config=None):
                 continue
 
             signal_rows=[]
+            if paper and not specs["spec_verified"]:
+                for signal in signals:
+                    signal_rows.append({"signal":signal.as_dict(),"status":"paper_blocked_unverified_contract_size",
+                        "reason":"Delta metadata did not provide both a confirmed lot increment and minimum order quantity."})
+                output.append({"symbol":symbol,"status":"contract_size_unverified",
+                    "profile":profile.as_dict(),"regime":regime.regime.value,"indicators":diagnostics,
+                    "contract_specs":specs,"paper_events":paper_events,"signals":signal_rows})
+                continue
             for signal in signals:
+                if not specs["spec_verified"]:
+                    signal_rows.append({"signal":signal.as_dict(),"status":"signal_only_contract_size_unverified",
+                        "reason":"Position quantity is not computed without verified lot increment and minimum size."})
+                    continue
                 if paper and (len(broker.state["positions"])+len(broker.state["pending"]))>=cfg.max_positions:
                     signal_rows.append({"signal":signal.as_dict(),"status":"max_positions_reached"})
                     continue
