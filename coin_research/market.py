@@ -43,9 +43,16 @@ class DeltaResearchData:
         return payload
 
     def fetch_products(self) -> list[dict]:
-        products, page = [], 1
+        products, after, seen_cursors = [], None, set()
         while True:
-            payload = self._get("/v2/products", {"page": page, "page_size": 1000})
+            params = {
+                "contract_types": "perpetual_futures",
+                "states": "upcoming,live,expired,settled",
+                "page_size": 1000,
+            }
+            if after:
+                params["after"] = after
+            payload = self._get("/v2/products", params)
             batch = payload.get("result")
             if not isinstance(batch, list):
                 raise ResearchDataError("Delta product catalog is not a list")
@@ -53,9 +60,17 @@ class DeltaResearchData:
                 product for product in batch
                 if product.get("contract_type") == "perpetual_futures"
             )
-            if len(batch) < 1000:
+            next_cursor = (payload.get("meta") or {}).get("after")
+            if not next_cursor:
+                if len(batch) >= params["page_size"]:
+                    raise ResearchDataError(
+                        "Delta product catalog omitted its next-page cursor; refusing an incomplete scan"
+                    )
                 return products
-            page += 1
+            if next_cursor == after or next_cursor in seen_cursors:
+                raise ResearchDataError("Delta product pagination cursor did not advance")
+            seen_cursors.add(next_cursor)
+            after = next_cursor
 
     def fetch_tickers(self) -> dict[str, dict]:
         rows = self._get("/v2/tickers").get("result", [])
