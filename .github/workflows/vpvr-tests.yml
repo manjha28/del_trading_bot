@@ -1,9 +1,10 @@
 name: VPVR safety tests
 on:
   push:
-    branches: [main, codex/vpvr-hft-engine]
+    branches: [main, codex/vpvr-hft-engine, codex/vpvr-hft-production-hardening]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 jobs:
   vpvr-tests:
     runs-on: ubuntu-latest
