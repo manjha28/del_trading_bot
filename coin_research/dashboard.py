@@ -51,7 +51,6 @@ def build_dashboard(
         wins = sum(value > 0 for value in returns)
         win_rate = f"{(100 * wins / len(returns)):.1f}%" if returns else "—"
         mean_net = f"{sum(returns) / len(returns):.3f}%" if returns else "—"
-        empty_candidates = '<tr><td colspan="4">No candidates.</td></tr>'
         return (
             f"<tr><td>{cell(name)}</td><td>{cell(variant)}</td><td>{cell(horizon)}h</td>"
             f"<td>{len(values)}</td><td>{win_rate}</td>"
@@ -101,10 +100,11 @@ def build_dashboard(
             )
             for row in ranked[:50]
         )
+        empty_candidates = '<tr><td colspan="4">No candidates.</td></tr>'
         return (
             f"<h2>{cell(title)}</h2><table><thead><tr><th>Symbol</th><th>State</th>"
             f"<th>Rank measurement</th><th>Why / state reasons</th></tr></thead>"
-            `f"<tbody>{body or empty_candidates}</tbody></table>"`.replaceAll("`","")
+            f"<tbody>{body or empty_candidates}</tbody></table>"
         )
 
     def acceleration(row):
