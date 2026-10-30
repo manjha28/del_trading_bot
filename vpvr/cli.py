@@ -64,6 +64,22 @@ def _restore_risk(engine, broker, today):
                                    if str(row.get("closed_at","")).startswith(key))
 
 
+
+def _current_paper_marks(positions, tickers):
+    """Mark open paper positions from current tickers, falling back to last confirmed marks."""
+    marks = {}
+    for symbol, position in positions.items():
+        ticker = tickers.get(symbol, {})
+        raw_mark = ticker.get("mark_price") or ticker.get("close")
+        fallback = position.get("last_mark") or position["entry"]
+        try:
+            mark = float(raw_mark) if raw_mark is not None else float(fallback)
+            marks[symbol] = mark if mark > 0 else float(fallback)
+        except (TypeError, ValueError):
+            marks[symbol] = float(fallback)
+    return marks
+
+
 def _process_new_paper_bars(broker, symbol, candles):
     last=broker.state.get("last_processed",{}).get(symbol)
     if last is None:
@@ -216,7 +232,7 @@ def scan_once(symbols, paper=False, config=None):
         except (MarketDataError,ValueError,KeyError) as exc:
             output.append({"symbol":symbol,"status":"data_or_signal_error","reason":str(exc)})
     return {"mode":"PAPER_ONLY" if paper else "SIGNAL_ONLY","exchange":"Delta Exchange India",
-        "account_balance":broker.balance,"account_equity":broker.equity(),
+        "account_balance":broker.balance,"account_equity":broker.equity(_current_paper_marks(broker.state["positions"],tickers)),
         "open_paper_positions":len(broker.state["positions"]),
         "pending_paper_entries":len(broker.state["pending"]),"results":output}
 
