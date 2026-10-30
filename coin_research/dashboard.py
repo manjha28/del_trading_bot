@@ -70,17 +70,21 @@ def build_dashboard(
             else "not_returned" if row["product_state"] == "not_returned"
             else "not_live"
         )
-        features = observation.get("features", {})
         market = observation.get("market", {})
         execution = observation.get("execution", {})
         detail = html.escape(json.dumps(observation, indent=2, sort_keys=True))
         score = observation.get("sleeping_score")
+        confidence = observation.get("data_quality", {}).get("confidence") if observation else None
+        spread = market.get("spread_pct")
+        score_text = f"{score:.1f}" if score is not None else None
+        confidence_text = f"{confidence:.2f}" if confidence is not None else None
+        spread_text = f"{spread:.4f}%" if spread is not None else None
         return f"""
         <tr data-state="{cell(displayed_state)}">
           <td>{cell(row['symbol'])}</td><td>{cell(row['product_state'])}</td>
-          <td>{cell(displayed_state)}</td><td>{cell(f'{score:.1f}' if score is not None else None)}</td>
-          <td>{cell(f'{observation.get('data_quality', {}).get('confidence', 0):.2f}' if observation else None)}</td>
-          <td>{cell(f'{market.get('spread_pct'):.4f}%' if market.get('spread_pct') is not None else None)}</td>
+          <td>{cell(displayed_state)}</td><td>{cell(score_text)}</td>
+          <td>{cell(confidence_text)}</td>
+          <td>{cell(spread_text)}</td>
           <td>{cell(execution.get('eligible') if observation else None)}</td>
           <td><details><summary>Inspect</summary><pre>{detail}</pre></details></td>
         </tr>"""
