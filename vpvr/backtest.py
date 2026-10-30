@@ -212,7 +212,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,
                         "holding_minutes":(ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60})
                     consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
                     position=None
-                elif (ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60>=cfg.max_hold_minutes:
+                elif position is pos and (ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60>=cfg.max_hold_minutes:
                     fill=bar["close"]*(1-cfg.slippage_bps/10000 if direction=="LONG" else 1+cfg.slippage_bps/10000)
                     qty=pos["remaining"]
                     gross=((fill-pos["entry"]) if direction=="LONG" else (pos["entry"]-fill))*qty*contract_multiplier
