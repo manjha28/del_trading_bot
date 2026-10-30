@@ -55,6 +55,37 @@ class DeltaMarketData:
             raise MarketDataError("Delta order-book response is missing buy/sell levels")
         return book
 
+    def fetch_funding_history(self, symbol, start_ts, end_ts, resolution="1h"):
+        """Fetch Delta public funding candles using the documented FUNDING:<symbol> syntax."""
+        supported = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
+        if resolution not in supported:
+            raise ValueError("unsupported funding history resolution")
+        if int(end_ts) <= int(start_ts):
+            raise ValueError("funding history end must be greater than start")
+        payload = self._get_json("/v2/history/candles", {
+            "symbol": f"FUNDING:{symbol}", "resolution": resolution,
+            "start": int(start_ts), "end": int(end_ts)
+        })
+        frame = pd.DataFrame(payload.get("result", []))
+        if frame.empty or not {"time", "close"}.issubset(frame.columns):
+            raise MarketDataError(f"funding history unavailable or malformed for {symbol}")
+        frame["time"] = pd.to_datetime(frame.time, unit="s", utc=True, errors="coerce")
+        frame["funding_rate"] = pd.to_numeric(frame.close, errors="coerce")
+        frame = frame.dropna(subset=["time", "funding_rate"]).sort_values("time")
+        if frame.empty:
+            raise MarketDataError(f"funding history contains no valid observations for {symbol}")
+        return frame[["time", "funding_rate"]].drop_duplicates("time").reset_index(drop=True)
+
+    def fetch_current_funding_rate(self, symbol, now=None, max_age_seconds=9 * 3600):
+        """Return the latest funding rate only when it is no more than nine hours old."""
+        end = int(now or time.time())
+        history = self.fetch_funding_history(symbol, end - 7 * 86400, end, resolution="1h")
+        latest = history.iloc[-1]
+        age = end - pd.Timestamp(latest.time).timestamp()
+        if age < -1 or age > max_age_seconds:
+            raise MarketDataError(f"funding rate is stale for {symbol} ({age:.0f}s old)")
+        return float(latest.funding_rate)
+
     def fetch_public_trades(self, symbol):
         """Return actual Delta aggressor-side trades for CVD and trade-level VP."""
         result = self._get_json(f"/v2/trades/{symbol}").get("result", {})
@@ -175,7 +206,7 @@ class DeltaMarketData:
             return None
         if multiplier is None or tick is None:
             return None
-        if product.get("trading_status") not in (None, "operational"):
+        if product.get("trading_status") != "operational":
             return None
         lot_increment_verified = product.get("lot_size") is not None
         minimum_verified = (product.get("minimum_order_size") is not None or
