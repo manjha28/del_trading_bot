@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -791,7 +792,39 @@ class ResearchDataStore:
                 total_trades = sum(
                     int(item.get("costed_simulated_count", 0)) for item in summaries
                 )
-                net_total = sum(pnl_values) if pnl_values else None
+                portfolio_records = [
+                    item["metrics"].get("portfolio", {}) for item in experiments
+                ]
+                compounded = bool(portfolio_records) and all(
+                    isinstance(item, dict)
+                    and item.get("compounded_oos_equity") is not None
+                    and item.get("initial_equity") is not None
+                    and item.get("final_equity") is not None
+                    for item in portfolio_records
+                ) and all(
+                    math.isclose(
+                        float(previous["final_equity"]),
+                        float(current["initial_equity"]),
+                        rel_tol=1e-10,
+                        abs_tol=1e-8,
+                    )
+                    for previous, current in zip(
+                        portfolio_records, portfolio_records[1:]
+                    )
+                )
+                initial_equity = (
+                    float(portfolio_records[0]["initial_equity"])
+                    if compounded else None
+                )
+                final_equity = (
+                    float(portfolio_records[-1]["final_equity"])
+                    if compounded else None
+                )
+                net_total = (
+                    final_equity - initial_equity
+                    if compounded
+                    else (sum(pnl_values) if pnl_values else None)
+                )
                 portfolio_drawdowns = [
                     item["metrics"].get("portfolio", {}).get("max_drawdown_pct")
                     for item in experiments
@@ -838,6 +871,8 @@ class ResearchDataStore:
                         for item in experiments
                     ],
                     "net_pnl_total": net_total,
+                    "initial_equity": initial_equity,
+                    "final_equity": final_equity,
                     "costed_trade_count": total_trades,
                     "net_expectancy_per_trade": (
                         net_total / total_trades if net_total is not None and total_trades else None
@@ -847,8 +882,12 @@ class ResearchDataStore:
                     ),
                     "execution_config": execution_config(first["config"]),
                     "aggregate_basis": (
-                        "sum of independent OOS fold PnL; folds are not compounded; "
-                        "drawdown is the maximum reported fold drawdown"
+                        "sequentially compounded non-overlapping OOS folds; "
+                        "net PnL is final equity minus initial equity; drawdown "
+                        "is the maximum reported fold drawdown"
+                        if compounded else
+                        "sum of reported OOS fold PnL; compounding provenance is "
+                        "unavailable; drawdown is the maximum reported fold drawdown"
                     ),
                 })
             comparable = (

@@ -201,6 +201,44 @@ def bootstrap_expectancy_interval(
     return float(lower), float(upper)
 
 
+def moving_block_bootstrap_expectancy_interval(
+    values: Iterable[float],
+    *,
+    confidence: float = 0.95,
+    iterations: int = 2000,
+    block_length: int | None = None,
+    seed: int = 0,
+) -> tuple[float, float] | None:
+    """Circular moving-block interval that preserves short-range PnL ordering."""
+    import numpy as np
+
+    sample = np.asarray(list(values), dtype=float)
+    if sample.ndim != 1 or not np.isfinite(sample).all():
+        raise ValueError("bootstrap values must be finite scalar observations")
+    if not 0 < confidence < 1:
+        raise ValueError("confidence must be between zero and one")
+    if iterations < 100:
+        raise ValueError("iterations must be at least 100")
+    if len(sample) < 4:
+        return None
+    if block_length is None:
+        block_length = max(2, round(len(sample) ** (1 / 3)))
+    if not isinstance(block_length, int) or not 2 <= block_length <= len(sample):
+        raise ValueError("block_length must be an integer in [2, sample size]")
+
+    rng = np.random.default_rng(seed)
+    blocks_per_sample = math.ceil(len(sample) / block_length)
+    offsets = np.arange(block_length)
+    starts = rng.integers(
+        0, len(sample), size=(iterations, blocks_per_sample)
+    )
+    indices = ((starts[..., None] + offsets) % len(sample)).reshape(iterations, -1)
+    means = sample[indices[:, :len(sample)]].mean(axis=1)
+    tail = (1 - confidence) / 2
+    lower, upper = np.quantile(means, [tail, 1 - tail])
+    return float(lower), float(upper)
+
+
 def deflated_sharpe_ratio(returns: Iterable[float], trial_count: int) -> float | None:
     """Approximate Deflated Sharpe probability using skew/kurtosis and trial count."""
     import numpy as np
@@ -267,6 +305,10 @@ def summarize_paper_results(results: Iterable[object]) -> dict:
     wins = [value for value in pnl if value > 0]
     losses = [value for value in pnl if value < 0]
     expectancy_ci = bootstrap_expectancy_interval(pnl)
+    block_length = max(2, round(len(pnl) ** (1 / 3))) if len(pnl) >= 4 else None
+    moving_block_expectancy_ci = moving_block_bootstrap_expectancy_interval(
+        pnl, block_length=block_length
+    )
     cumulative = 0.0
     peak = 0.0
     max_drawdown = 0.0
@@ -284,6 +326,8 @@ def summarize_paper_results(results: Iterable[object]) -> dict:
         "net_pnl_total": sum(pnl) if pnl else None,
         "net_expectancy_per_simulated_trade": sum(pnl) / len(pnl) if pnl else None,
         "expectancy_bootstrap_iid_95pct": expectancy_ci,
+        "expectancy_bootstrap_moving_block_95pct": moving_block_expectancy_ci,
+        "moving_block_length": block_length,
         "win_rate_pct": len(wins) / len(pnl) * 100 if pnl else None,
         "profit_factor": sum(wins) / abs(sum(losses)) if losses else None,
         "profit_factor_is_unbounded": bool(wins and not losses),
@@ -294,8 +338,10 @@ def summarize_paper_results(results: Iterable[object]) -> dict:
             "Descriptive in-sample/paper metrics only; uncosted exit-only outcomes "
             "are excluded from net PnL metrics. The reported expectancy interval "
             "is iid bootstrap and does not correct temporal dependence. No "
-            "walk-forward correction, portfolio drawdown, or selection-bias "
-            "adjustment is implied."
+            "moving-block intervals preserve only short-range sequence structure "
+            "under a circular stationary approximation; neither interval is a "
+            "selection-bias correction. No portfolio drawdown or independent "
+            "replication is implied."
         ),
     }
 

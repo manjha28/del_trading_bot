@@ -9,6 +9,7 @@ from research_platform.validation import (
     bootstrap_expectancy_interval,
     chronological_split,
     deflated_sharpe_ratio,
+    moving_block_bootstrap_expectancy_interval,
     purged_chronological_split,
     summarize_paper_results,
     walk_forward_splits,
@@ -101,6 +102,22 @@ class ChronologicalValidationTests(unittest.TestCase):
         self.assertTrue(summary["profit_factor_is_unbounded"])
         self.assertIsNone(summary["expectancy_bootstrap_iid_95pct"])
         json.dumps(summary, allow_nan=False)
+
+    def test_moving_block_bootstrap_is_deterministic_and_requires_sequence_length(self):
+        pnl = [1.0, 1.1, -0.5, -0.4, 0.8, 0.9, -0.2, -0.1]
+        first = moving_block_bootstrap_expectancy_interval(
+            pnl, iterations=200, seed=7
+        )
+        second = moving_block_bootstrap_expectancy_interval(
+            pnl, iterations=200, seed=7
+        )
+        self.assertEqual(first, second)
+        self.assertIsNotNone(first)
+        self.assertIsNone(
+            moving_block_bootstrap_expectancy_interval([1.0, -1.0, 0.5])
+        )
+        with self.assertRaisesRegex(ValueError, "block_length"):
+            moving_block_bootstrap_expectancy_interval(pnl, block_length=1)
 
     def test_purged_split_removes_rows_with_overlapping_label_windows(self):
         split = purged_chronological_split(

@@ -87,7 +87,7 @@ class WalkForwardEvaluationTests(unittest.TestCase):
         self.assertTrue(simulated)
         self.assertTrue(all(item["exit_reason"] == "FOLD_END" for item in simulated))
         self.assertTrue(all(
-            datetime.fromisoformat(item["exit_time"]) <= T0 + timedelta(minutes=118)
+            datetime.fromisoformat(item["exit_time"]) == T0 + timedelta(minutes=117)
             for item in simulated
         ))
         self.assertEqual(sweep["per_symbol"]["1"]["coverage_state"], "signal")
@@ -101,6 +101,21 @@ class WalkForwardEvaluationTests(unittest.TestCase):
     def test_runner_rejects_empty_folds_and_missing_universe(self):
         with self.assertRaisesRegex(ValueError, "at least one"):
             evaluate_walk_forward_variants([], {}, [])
+
+    def test_runner_rejects_overlapping_oos_folds(self):
+        periods = frame(30, "5min")[["time"]]
+        fold = chronological_split(
+            periods,
+            train_end=T0 + timedelta(minutes=45),
+            validation_end=T0 + timedelta(minutes=90),
+            out_of_sample_end=T0 + timedelta(minutes=117),
+        )
+        with self.assertRaisesRegex(ValueError, "must not overlap"):
+            evaluate_walk_forward_variants(
+                [verified_instrument()],
+                {"1": {}},
+                [fold, fold],
+            )
 
 
 if __name__ == "__main__":

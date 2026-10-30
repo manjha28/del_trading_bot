@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 import requests
 import pandas as pd
 from delta_client import client, is_authenticated
+from delta_rest_client import OrderType
 from scanner import get_live_perpetual_futures, get_market_stats
 from strategy_short import (
     UnifiedShortConfig,
@@ -24,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 # ── Runtime config ────────────────────────────────────────────────────────────
 AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"
+ENABLE_LIVE_ORDERS = os.getenv("ENABLE_LIVE_ORDERS", "false").strip().lower() == "true"
+EXECUTION_HALT = False
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "6"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
 MIN_BALANCE = float(os.getenv("MIN_BALANCE_TO_TRADE", "10.0"))
@@ -168,6 +171,19 @@ def save_state(s):
         json.dump(s, f, indent=2, default=str)
 
 
+def halt_live_entries(reason, state=None):
+    global EXECUTION_HALT
+    EXECUTION_HALT = True
+    if state is not None:
+        state["execution_halt"] = True
+        state["execution_halt_reason"] = reason
+        try:
+            save_state(state)
+        except OSError as e:
+            logger.critical("Could not persist live-entry halt: %s", e)
+    logger.critical("Live entries halted: %s", reason)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXCHANGE HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -253,6 +269,9 @@ def adjust_qty_for_lot_size(qty: int, lot_size: float, symbol: str) -> int:
 
 def place_entry(pid, qty, price):
     """Place limit sell order. Price rounded to 6dp [8]."""
+    if not ENABLE_LIVE_ORDERS:
+        logger.error("Entry blocked: ENABLE_LIVE_ORDERS is not true")
+        return None
     try:
         d = client.request("POST", "/v2/orders", payload={
             "product_id": pid, "size": qty, "side": "sell",
@@ -275,7 +294,7 @@ def place_sl(pid, qty, sl):
             product_id=pid,
             size=qty,
             side="buy",
-            order_type="market_order",
+            order_type=OrderType.MARKET,
             stop_price=str(sl_rounded),
         )
     except Exception as e:
@@ -302,10 +321,15 @@ def place_tp(pid, qty, tp):
 
 def cancel(pid, oid):
     try:
-        client.request("DELETE", f"/v2/orders/{oid}",
-                        payload={"product_id": pid}, auth=True)
-        return True
-    except Exception:
+        response = client.request(
+            "DELETE",
+            f"/v2/orders/{oid}",
+            payload={"product_id": pid},
+            auth=True,
+        )
+        return bool(response.json().get("success"))
+    except Exception as e:
+        logger.error("Cancel order %s failed: %s", oid, e)
         return False
 
 
@@ -318,17 +342,76 @@ def market_close(pid, qty):
         return None
 
 
-def wait_fill(pid, oid, timeout=120):
+def _filled_order_quantity(order):
+    if not isinstance(order, dict):
+        return None
+    try:
+        size = abs(float(order["size"]))
+        unfilled = abs(float(order["unfilled_size"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(size) or not math.isfinite(unfilled):
+        return None
+    filled = size - unfilled
+    if filled < 0:
+        return None
+    return filled
+
+
+def _cancel_and_confirm_fill(pid, oid, expected_qty, last_filled):
+    cancelled = cancel(pid, oid)
+    if not cancelled:
+        logger.warning("Order %s cancellation was not confirmed", oid)
+    try:
+        order = client.get_order_by_id(oid)
+    except Exception as e:
+        logger.error("Final order status lookup failed for %s: %s", oid, e)
+        return None
+    filled = _filled_order_quantity(order)
+    if filled is None:
+        logger.error("Final order status for %s has unusable fill quantities", oid)
+        return None
+    state = str(order.get("state", "")).lower() if isinstance(order, dict) else ""
+    if filled >= expected_qty:
+        return filled
+    if state in {"closed", "cancelled", "canceled"}:
+        return filled
+    logger.error(
+        "Order %s cancellation/final fill state is unconfirmed "
+        "(last known fill %.8g)",
+        oid,
+        last_filled,
+    )
+    return None
+
+
+def wait_fill(pid, oid, expected_qty, timeout=120):
+    if not math.isfinite(float(expected_qty)) or expected_qty <= 0:
+        raise ValueError("expected_qty must be positive and finite")
+    if not math.isfinite(float(timeout)) or timeout < 0:
+        raise ValueError("timeout must be finite and non-negative")
     start = time.time()
+    last_filled = 0.0
     while time.time() - start < timeout:
         try:
-            if oid not in [o["id"] for o in client.get_live_orders()]:
-                return True
-        except Exception:
-            pass
+            order = client.get_order_by_id(oid)
+        except Exception as e:
+            logger.warning("Order status lookup failed for %s: %s", oid, e)
+            time.sleep(2)
+            continue
+        filled = _filled_order_quantity(order)
+        if filled is None:
+            logger.error("Order %s returned no usable fill quantities", oid)
+            return _cancel_and_confirm_fill(pid, oid, expected_qty, last_filled)
+        last_filled = filled
+        state = str(order.get("state", "")).lower()
+        if filled >= expected_qty:
+            return filled
+        if state in {"closed", "cancelled", "canceled"}:
+            return filled
         time.sleep(2)
-    cancel(pid, oid)
-    return False
+
+    return _cancel_and_confirm_fill(pid, oid, expected_qty, last_filled)
 
 
 def open_positions():
@@ -340,6 +423,15 @@ def open_positions():
         return 0
 
 
+def _order_id(response):
+    if not isinstance(response, dict):
+        return None
+    result = response.get("result")
+    if isinstance(result, dict) and result.get("id"):
+        return result["id"]
+    return response.get("id")
+
+
 def place_brackets(pid, qty, entry, sl):
     """Place SL + TP bracket orders using lot-adjusted qty [19]."""
     q1 = qty // 2
@@ -349,19 +441,14 @@ def place_brackets(pid, qty, entry, sl):
               "q1": q1, "sl_id": None, "tp_id": None}
 
     resp = place_sl(pid, qty, sl)
-    if resp:
-        try:
-            result["sl_id"] = resp.get("result", {}).get("id")
-        except Exception:
-            pass
+    result["sl_id"] = _order_id(resp)
+    if not result["sl_id"]:
+        result["error"] = "protective stop order was not confirmed"
+        return result
 
     if q1 > 0 and tp_2r > 0:
         resp = place_tp(pid, q1, tp_2r)
-        if resp:
-            try:
-                result["tp_id"] = resp.get("result", {}).get("id")
-            except Exception:
-                pass
+        result["tp_id"] = _order_id(resp)
 
     return result
 
@@ -465,7 +552,16 @@ def manage_trailing(pid, symbol, bracket, entry_ts, liq_guard_usd=LIQ_GUARD_USD)
             send_telegram(f"<b>Monitor error</b> — {symbol}\n{e}")
 
 
-def execute_trade(pid, symbol, sig, bal, lot_size):
+def execute_trade(pid, symbol, sig, bal, lot_size, state=None):
+    if EXECUTION_HALT:
+        logger.critical("%s: live entries are halted pending manual review", symbol)
+        return None
+    if not ENABLE_LIVE_ORDERS:
+        logger.warning(
+            "%s: live entry blocked; set ENABLE_LIVE_ORDERS=true to arm entries",
+            symbol,
+        )
+        return None
     if not is_authenticated():
         return None
 
@@ -512,20 +608,62 @@ def execute_trade(pid, symbol, sig, bal, lot_size):
     # ── Place entry with lot-adjusted qty ────────────────────────────
     resp = place_entry(pid, qty_in_lots, sig["entry"])
     if not resp:
+        halt_live_entries(
+            f"entry submission result is unknown for {symbol}",
+            state,
+        )
         send_telegram(f"<b>ENTRY FAILED</b> — {symbol}")
         return None
 
-    oid = resp.get("result", {}).get("id")
-    if not oid or not wait_fill(pid, oid):
-        send_telegram(f"<b>NOT FILLED</b> — {symbol}\nCancelled after timeout.")
+    oid = _order_id(resp)
+    if not oid:
+        halt_live_entries(f"entry response has no order ID for {symbol}", state)
+        send_telegram(
+            f"<b>ENTRY ERROR</b> — {symbol}\n"
+            "Exchange response did not include an order ID."
+        )
+        return None
+
+    filled_qty = wait_fill(pid, oid, qty_in_lots)
+    if filled_qty is None:
+        halt_live_entries(f"entry fill status is unknown for {symbol}", state)
+        send_telegram(
+            f"<b>URGENT ORDER STATUS UNKNOWN</b> — {symbol}\n"
+            "Do not submit another entry; verify the exchange position and order manually."
+        )
+        return None
+    if filled_qty <= 0:
+        send_telegram(f"<b>NOT FILLED</b> — {symbol}\nNo filled quantity was confirmed.")
         return None
 
     # ── Brackets with lot-adjusted qty [19] ──────────────────────────
-    bracket = place_brackets(pid, qty_in_lots, sig["entry"], sig["stop_loss"])
+    bracket = place_brackets(pid, filled_qty, sig["entry"], sig["stop_loss"])
+    if not bracket["sl_id"]:
+        close_response = market_close(pid, filled_qty)
+        close_confirmed = (
+            isinstance(close_response, dict)
+            and close_response.get("success") is True
+        )
+        logger.critical(
+            "%s: protective stop was not confirmed; emergency close confirmed=%s response=%r",
+            symbol,
+            close_confirmed,
+            close_response,
+        )
+        halt_live_entries(
+            f"protective stop failed for {symbol}; manual position review required",
+            state,
+        )
+        send_telegram(
+            f"<b>URGENT PROTECTION FAILURE</b> — {symbol}\n"
+            f"Emergency close {'accepted' if close_confirmed else 'NOT CONFIRMED'}. "
+            "Verify position and orders manually."
+        )
+        return None
     send_telegram(
         f"<b>TRADE OPENED</b> — {symbol}\n"
         f"Filled @ {sig['entry']:.6f}\n"
-        f"SL @ {sig['stop_loss']:.6f} | Lots: {qty_in_lots}"
+        f"SL @ {sig['stop_loss']:.6f} | Filled lots: {filled_qty:g}"
     )
 
     result = manage_trailing(pid, symbol, bracket, time.time())
@@ -546,6 +684,8 @@ def execute_trade(pid, symbol, sig, bal, lot_size):
 
 def run():
     state = load_state()
+    global EXECUTION_HALT
+    EXECUTION_HALT = EXECUTION_HALT or bool(state.get("execution_halt", False))
     today = date.today().isoformat()
     if state.get("last_trade_day") != today:
         state["trade_count"] = 0
@@ -565,6 +705,7 @@ def run():
         and not at_daily_limit
         and bal >= MIN_BALANCE
         and cap >= 1.0
+        and not EXECUTION_HALT
     )
 
     logger.info(
@@ -688,7 +829,9 @@ def run():
             )
 
             try:
-                result = execute_trade(f["product_id"], symbol, sig, bal, lot_size)
+                result = execute_trade(
+                    f["product_id"], symbol, sig, bal, lot_size, state=state
+                )
             except Exception as e:
                 logger.error(f"{symbol} execute error: {e}")
                 send_telegram(f"<b>Execution error</b>\n{symbol}: {e}")
@@ -734,6 +877,8 @@ def run():
         status_parts.append("Max positions")
     if at_daily_limit:
         status_parts.append("Daily limit")
+    if EXECUTION_HALT:
+        status_parts.append("Live entries halted — manual review required")
     status = " | ".join(status_parts) if status_parts else "Ready"
 
     send_telegram(
@@ -771,6 +916,8 @@ if __name__ == "__main__":
         f"Strategy: MHR_EXHAUSTION SHORT\n"
         f"Scan: every 1 hour\n"
         f"Cap: ${MAX_LIVE_CAPITAL:.2f} | Liq guard: ${LIQ_GUARD_USD:.2f}\n"
+        f"Live entries: {'ARMED' if ENABLE_LIVE_ORDERS else 'DISABLED'}\n"
+        f"Execution halt: {'ACTIVE' if EXECUTION_HALT else 'clear'}\n"
         f"Confirm: {'Auto' if AUTO_EXECUTE else 'Telegram'}"
     )
     while True:

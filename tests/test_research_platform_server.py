@@ -253,6 +253,62 @@ class ResearchPlatformServerTests(unittest.TestCase):
             for item in unmatched["strategies"]
         ))
 
+    def test_leaderboard_reports_compounded_equity_when_fold_chain_is_continuous(self):
+        config = {
+            "initial_equity": 1_000,
+            "max_open_positions": 3,
+            "max_portfolio_risk_pct": 0.015,
+            "max_gross_leverage": 2.0,
+            "max_pairwise_correlation": 0.8,
+            "correlation_lookback_minutes": 60,
+            "minimum_correlation_observations": 30,
+            "trade_risk_pct": 0.005,
+            "trade_leverage": 2.0,
+            "fee_rate": 0.0005,
+            "spread_bps": 5,
+            "slippage_bps": 2,
+        }
+        with ResearchDataStore(self.db_path) as store:
+            for fold, start, end, initial, final in (
+                (0, "2026-01-08", "2026-01-15", 1_000, 1_010),
+                (1, "2026-01-15", "2026-01-22", 1_010, 990),
+            ):
+                store.save_experiment(
+                    f"wf-compound99-strategy_a-{fold:03d}",
+                    "strategy_a",
+                    "v1",
+                    "dataset-compound",
+                    {
+                        "fold": fold,
+                        "out_of_sample_start": f"{start}T00:00:00+00:00",
+                        "out_of_sample_end": f"{end}T00:00:00+00:00",
+                    },
+                    config,
+                    {
+                        "summary": {
+                            "net_pnl_total": final - initial,
+                            "costed_simulated_count": 1,
+                        },
+                        "portfolio": {
+                            "initial_equity": initial,
+                            "final_equity": final,
+                            "compounded_oos_equity": final,
+                            "max_drawdown_pct": 0.02,
+                        },
+                    },
+                    status="completed",
+                )
+        _, response = self.get("/api/leaderboard")
+        comparison = next(
+            item for item in response["comparisons"]
+            if item["comparison_set_id"].endswith(":wf-compound99")
+        )
+        entry = comparison["strategies"][0]
+        self.assertEqual(entry["initial_equity"], 1_000)
+        self.assertEqual(entry["final_equity"], 990)
+        self.assertEqual(entry["net_pnl_total"], -10)
+        self.assertIn("sequentially compounded", entry["aggregate_basis"])
+
     def test_api_exposes_variant_gates_and_aggregates_existing_sources_read_only(self):
         _, variants = self.get("/api/variants")
         catalog = {item["strategy_id"]: item for item in variants["items"]}

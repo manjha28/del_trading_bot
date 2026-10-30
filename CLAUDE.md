@@ -89,7 +89,11 @@ Key behavioural details:
 - **Entry path filter** — `--entry-paths` arg limits which paths fire; default is all three but `MHR_EXHAUSTION` only is recommended.
 
 ### `main.py`
-Live trading loop. Runs once per hour. Evaluates all live perpetuals, respects daily trade cap (6), max open trades (3), cooldown (1h), min balance ($10 USDT). Requires `.env` credentials for order placement. `AUTO_EXECUTE=false` by default — prompts `y/n` confirmation before placing orders.
+Live trading loop. Runs once per hour. Evaluates all live perpetuals, respects daily trade cap (6), max open trades (3), cooldown (1h), min balance ($10 USDT). Requires `.env` credentials and `ENABLE_LIVE_ORDERS=true` to submit new entries; the latter defaults to false. When armed, `AUTO_EXECUTE=false` by default and prompts for confirmation before placing orders.
+
+Ambiguous entry status or an unconfirmed protective stop sets a persistent
+`execution_halt` in `trade_state.json` and blocks further new entries. Clear
+that state only after reconciling all exchange orders and positions manually.
 
 ### `long_strategy.py`
 WIP. Not imported anywhere. Contains fast/slow MA crossover logic with 12 MA types. **Second priority after short strategy is stable in live trading.**
@@ -227,6 +231,7 @@ Worst: ARCUSD (−$2.87), PARTIUSD (−$2.63) — too few MHR_EXHAUSTION setups 
 
 | Setting | Default | Env var override |
 |---------|---------|-----------------|
+| Enable new live entries | false | `ENABLE_LIVE_ORDERS=true` |
 | Auto-execute orders | false | `AUTO_EXECUTE=true` |
 | Max trades per day | 6 | `MAX_TRADES_PER_DAY` |
 | Max concurrent open trades | 3 | `MAX_OPEN_TRADES` |
@@ -304,6 +309,7 @@ DELTA_API_SECRET=your_secret
 DELTA_BASE_URL=https://api.india.delta.exchange  # optional, this is the default
 
 # Optional live trading overrides
+ENABLE_LIVE_ORDERS=false
 AUTO_EXECUTE=false
 MAX_TRADES_PER_DAY=6
 MAX_OPEN_TRADES=3
@@ -366,7 +372,8 @@ Note: `scanner.py` and `backtest.py` set `session.trust_env = False`, so they by
 | REENTRY path | Negative net. Dependent on prior MHR_EXHAUSTION trades to trigger; marginal at best |
 | `watching` state | Lost on `main.py` restart — reentry tracking does not persist across sessions |
 | Position monitoring | REST polling only, no WebSocket — 60s sleep between loop iterations |
-| `AUTO_EXECUTE=false` | Bot is semi-automated; requires terminal supervision for confirmation |
+| `ENABLE_LIVE_ORDERS=false` | New entries are blocked; protective/close operations remain available for existing positions |
+| `AUTO_EXECUTE=false` | When entries are armed, requires terminal supervision for confirmation |
 | `long_strategy.py` | Complete in isolation but not wired into backtest or live trading |
 | `scalp_pullback` | Not in `main.py`; planned for live HFT use eventually |
 | EMA20/RSI14 gates | Tested — adding gates makes performance worse (winners have lower RSI/EMA dist than losers) |

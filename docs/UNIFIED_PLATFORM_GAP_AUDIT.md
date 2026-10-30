@@ -4,8 +4,10 @@
 
 This document began as a Phase 1 audit and integration design. The progress
 section below tracks additive research-platform work. Existing strategy
-implementations, the `coin_research` scanner, VPVR paper-only boundary,
-historical reports, and live-order code remain intact. The shared paper
+implementations, the `coin_research` scanner, VPVR paper-only boundary, and
+historical reports remain intact. The existing MHR order flow is not connected
+to the research platform and requires an explicit `ENABLE_LIVE_ORDERS=true`
+interlock to submit new entries. The shared paper
 simulator gained an optional strict fold cutoff; its default path remains
 compatible.
 
@@ -28,7 +30,7 @@ research package is not connected to the live order loop.
   records; adapters wrap `coin_research` and
   VPVR public REST clients. Exchange/source timestamps, aggressor side, and
   product metadata are retained. Candle timeframes and product-state coverage
-  are declared per provider.   unsupported historical OI, liquidations, and reconstructed order-book deltas
+  are declared per provider. Unsupported historical OI, liquidations, and reconstructed order-book deltas
   remain unavailable.
 - **Canonical SQLite store v4:** stores product snapshots, candles, ticker
   snapshots, trade prints, L2 snapshots, funding, and quality records in a
@@ -92,9 +94,9 @@ research package is not connected to the live order loop.
   candles, builds expanding chronological folds, hashes the dataset and
   contract metadata, records each experiment and trade outcome, and keeps
   discovered products with missing history in coverage. It also reports an
-  approximate Deflated-Sharpe diagnostic and IID bootstrap expectancy
-  interval; neither is dependence-robust or a substitute for independent
-  replication. The CLI does not load complete historical trades/books/funding,
+  approximate Deflated-Sharpe diagnostic, IID and circular moving-block
+  expectancy intervals; these remain sensitivity diagnostics, not
+  selection-adjusted inference or independent replication. The CLI does not load complete historical trades/books/funding,
   so those candidates remain visibly insufficient or unavailable.
   Every validation and OOS portfolio receives an explicit exit cutoff. Only
   completed 1m candles closing at or before that cutoff are considered. A
@@ -120,7 +122,19 @@ research package is not connected to the live order loop.
   and ranked by net PnL after costs. The API reports trade counts, fold
   periods, execution assumptions, fold drawdown, and selector difference to
   best standalone strategy. Comparability is explicitly false when OOS periods
-  or execution assumptions differ. Fold PnL is not compounded.
+  or execution assumptions differ. Standalone strategies and the selector compound
+  equity sequentially across non-overlapping OOS folds; fold-end settlement is
+  applied before the next fold's position sizing.
+- **Legacy live-entry safety:** the existing MHR order path is still isolated
+  from research strategies and now blocks new entries unless
+  `ENABLE_LIVE_ORDERS=true`. Entry completion is checked through the SDK's
+  order-by-ID response; partial fills are sized to the confirmed quantity,
+  stop-order enum/response handling follows the installed Delta SDK, and an
+  unconfirmed protective stop triggers a reduce-only emergency-close request.
+  Ambiguous order status or stop failure persists an execution halt in
+  `trade_state.json` until an operator reconciles positions and clears it.
+  These behaviors are covered with mocked clients only; live exchange response
+  and recovery behavior remain unverified.
 
 ## Current master-task checklist
 
@@ -131,12 +145,15 @@ research package is not connected to the live order loop.
 - [x] Keep unsupported book/OI/liquidation/funding history explicit; never fabricate it.
 - [x] Add independent paper strategy variants, contract-aware cost model, portfolio gates, and selector.
 - [x] Enforce completed-candle fold exits and persist an explicit fold-end close policy.
+- [x] Compound standalone and selector equity across strictly non-overlapping OOS folds.
+- [x] Require explicit `ENABLE_LIVE_ORDERS=true` before the existing MHR entry path can place an order.
 - [x] Expose market/feed events, legacy research summaries, experiments, and OOS comparisons in a loopback-only dashboard.
 - [ ] Validate public WebSocket capture against the live exchange and implement sequence-aware book resync/replay.
 - [ ] Obtain/verify broader historical trade, book, funding, mark/index, OI, and liquidation coverage.
 - [ ] Complete depth/impact, partial fills, latency, funding cash flow, margin/liquidation, and portfolio stress execution models.
 - [ ] Integrate legacy and VPVR strategies into identical-cost walk-forward runs without changing their implementations.
-- [ ] Add dependence-robust statistical validation, walk-forward compounding, and independent replication.
+- [x] Add a circular moving-block expectancy interval alongside the IID interval.
+- [ ] Complete selection-adjusted statistical validation and independent replication.
 - [ ] Pass full end-to-end live-feed/recovery and product-contract acceptance tests.
 
 Start collection with persistent raw WebSocket capture (requires network access):
@@ -157,11 +174,16 @@ implementation run.
 research-only, not a fully integrated trading research stack. The shared
 simulator still lacks depth/impact, partial fills, latency, funding cash
 flows, margin/liquidation and portfolio correlation stress scenarios.
-Walk-forward fold reports are not compounded across folds; the selector uses
+Standalone and selector equity now compound across strictly non-overlapping
+OOS folds; the reported moving-block interval is a limited dependence
+sensitivity diagnostic, not a fully dependence-robust inference method. The selector uses
 simple validation expectancy gating and is not selection-adjusted. Regimes
 use OHLCV proxies only. Historical OI, liquidations, reconstructed
 order-book deltas, and validated synchronized depth history remain
-unsupported. No live order path was changed or enabled.
+unsupported. The existing MHR live order path remains separate from research
+signals and is not enabled by default; its new-entry route fails closed unless
+`ENABLE_LIVE_ORDERS=true` is explicitly configured. No live request or order was
+sent during this work.
 
 ## 1. Current dependency and data-flow map
 
@@ -259,9 +281,9 @@ store; it is not yet a unified dashboard over VPVR and legacy reports.
 | Strategy coverage | Existing six strategy entry adapters remain; the variant suite registers ten independent families and implements five OHLCV-based research variants. The validation-gated selector is connected to walk-forward paper evaluation. | Legacy and VPVR strategies are not all dispatched through this runner. Absorption, liquidation, and basis/funding variants are unavailable; trade-flow and book strategies require data the CLI does not load. | Expand only with valid evidence and preserve strategy-specific provenance. Do not infer missing data or treat related diagnostics as validated variants. |
 | Risk / contract sizing | Legacy strategy risk remains separate; the new OHLCV paper simulator sizes from verified contract rules. Portfolio admission caps stop risk, gross exposure, slots, same-product overlap, and same-direction pairwise correlation. | No shared contract sizing integration in legacy/VPVR paths; no full sector or portfolio stress/correlation model. | Preserve separate strategy sizing and use verified specs; improve stress and correlation only from aligned data. |
 | Execution simulation | A shared paper portfolio runner composes the single-trade OHLCV simulator and applies explicit fees, spread, slippage, stop-first ambiguity, exposure limits, and fail-closed correlation gates. | No partial fills, latency, depth/impact, funding cash flows, maintenance margin/liquidation, or full portfolio stress. OHLCV cannot resolve all intrabar ordering. | Add validated market microstructure and funding/margin models. Keep simulator isolated from live client. |
-| Validation / ranking | Walk-forward CLI stores dataset/config versions, standalone OOS outcomes, per-symbol coverage, approximate DSR/IID intervals, and a selector fitted only from prior validation outcomes. | No dependence-robust uncertainty, selection-adjusted leaderboard, multi-fold compounding, or independent replication. Only implemented OHLCV variants are scored by CLI. | Extend evidence quality without using OOS outcomes for selection; report coverage, costs, and limitations for every product. |
+| Validation / ranking | Walk-forward CLI stores dataset/config versions, standalone OOS outcomes, per-symbol coverage, approximate DSR plus IID/moving-block intervals, and a selector fitted only from prior validation outcomes. | No selection-adjusted leaderboard or independent replication; moving-block intervals remain assumption-sensitive. Only implemented OHLCV variants are scored by CLI. | Extend evidence quality without using OOS outcomes for selection; report coverage, costs, and limitations for every product. |
 | Dashboard | The local read-only UI/API exposes canonical observations, raw stream events/health, experiments, OOS leaderboard groups, evaluations, selector decisions, paper outcomes, and source-specific coin research/VPVR/MHR summaries. | It does not normalize historic subsystem trades or claim pooled cross-subsystem performance; unsupported depth/market-regime diagnostics remain unavailable. | Preserve read-only behavior; add cross-subsystem performance only after source alignment and coverage checks. |
-| Live boundary | `main.py` contains authenticated order placement and position management; `AUTO_EXECUTE=false` requires confirmation but can be enabled. VPVR paper mode is separate. | A research integration must not accidentally route normalized signals into the existing order path. | Keep all new orchestration shadow/paper-only. No changes to `main.py`, authenticated client, or order behavior in this audit or initial integration stages. |
+| Live boundary | `main.py` contains authenticated order placement and position management; `ENABLE_LIVE_ORDERS=false` blocks new entries by default, while `AUTO_EXECUTE=false` adds a confirmation prompt after the interlock is armed. Fill quantity and protective-stop response handling are tested with mocks; ambiguous states persist a manual-review halt. VPVR paper mode is separate. | Research signals are not routed into the legacy MHR order flow; live exchange response, network-failure, idempotency, and operational recovery have not been validated. | Keep new research orchestration shadow/paper-only; validate the MHR flow with exchange test facilities before any real-fund use. |
 
 ## 3. Shared interfaces and remaining integration
 
@@ -330,8 +352,8 @@ from discovery or research coverage.
 | 3. Strategy adapters | Entry wrappers implemented; exit normalization partial | Entry adapters wrap the six existing strategies. MHR, Scalp, and Fast/Slow exit simulators have normalized result wrappers; VPVR has a normalized plan but remains on its native paper engine. No common exit callback contract or live integration exists. | Parity fixtures show wrapper outputs match legacy behavior; no changes to MHR/live behavior; all signals contain timestamp and provenance; remaining VPVR behavior and stateful exits are explicitly covered. |
 | 4. Research variants | Partial; OHLCV variants implemented | Five OHLCV-based variants have research-only signals; trade-flow and book variants require evidence not loaded by the current backtest CLI. Absorption, liquidation, and basis/funding variants remain unavailable. | Per-variant unit tests, no-lookahead and source-validity tests; valid trade/book history is required before enabling those variants. |
 | 5. Common simulator | Partial; constrained portfolio paper simulation implemented | Verified contract rules, fees, spread, slippage, stop gaps, conservative intrabar ambiguity, explicit fold-boundary exits, portfolio slots, notional, stop-risk, and same-direction correlation gates are modeled. No depth/impact, latency, partial fills, funding, margin/liquidation, or correlation stress. | Add validated market-impact/fill/funding/margin models. Simulator remains isolated from live client. |
-| 6. Validation / experiments | Partial; walk-forward CLI implemented | Schema-v4 registry, expanding chronological folds, strict completed-candle fold cutoff, explicit open-position boundary close, embargo/purge helpers, IID expectancy intervals, approximate DSR, and persisted per-trade outcomes exist. Fold equity is not compounded; statistical checks are approximations. | Add dependence-aware uncertainty, experiment selection controls, robustness testing, and independent replication. Include all discovered products in coverage. |
-| 7. Strategy selection / portfolio | Partial; validation-gated selector implemented | Validation-period per-regime expectancy gates OOS selection and permits no-trade; same-product overlaps and high/unestimable same-direction pairwise correlation are rejected. There is no sector stress model, multi-period compounding, or selector robustness/selection adjustment. | Add deeper dependency/correlation stress, compounded multi-fold accounting, and unseen independent confirmation. |
+| 6. Validation / experiments | Partial; walk-forward CLI implemented | Schema-v4 registry, expanding chronological folds, strict completed-candle fold cutoff, explicit open-position boundary close, embargo/purge helpers, IID and moving-block expectancy intervals, approximate DSR, compounded OOS folds, and persisted per-trade outcomes exist. Statistical checks remain approximations. | Add selection controls, robustness testing, and independent replication. Include all discovered products in coverage. |
+| 7. Strategy selection / portfolio | Partial; validation-gated selector implemented | Validation-period per-regime expectancy gates OOS selection and permits no-trade; same-product overlaps and high/unestimable same-direction pairwise correlation are rejected. Sequential fold compounding exists; there is no sector stress model or selector robustness/selection adjustment. | Add deeper dependency/correlation stress and unseen independent confirmation. |
 | 8. Unified read-only dashboard | Partial; live capture and OOS summaries surfaced | Local read-only API/UI exposes canonical data, raw market events, stream health, evaluations, experiments, simulations, coin-research candidates/events, VPVR paper state, MHR report inventory, and comparable OOS leaderboard groups. It does not normalize every subsystem's trade-level data. | Keep reads read-only; add cross-subsystem data normalization only with explicit provenance and coverage tests. |
 | 9. Validation | Partial | Unit/integration tests cover strict fold cutoff, derived-bar completeness, durable event persistence, and dashboard queries; fixtures do not validate live exchange recovery, sequence-aware book resync, all strategy no-lookahead behavior, or every contract rule. | Add feed outage/resync, contract-size, broader no-lookahead, and independent cross-strategy data tests. |
 
@@ -384,7 +406,8 @@ end-to-end integration.
   revalidated as OOS evidence by this architecture audit.
 - `long_strategy.py` is standalone; its signal helpers calculate strategy-local
   sizing and are not dispatched by the existing backtest/live stack.
-- Existing live order placement in `main.py` is intentionally out of scope.
-  No live order execution has been enabled or changed.
+- Existing live order placement in `main.py` remains separate from research.
+  New entries now fail closed unless `ENABLE_LIVE_ORDERS=true`; only mocked
+  client responses were used in tests, and no exchange request was sent.
 - This work preserves existing subsystem stores and reports and keeps the
   exchange-authenticated order flow outside the research package.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Mapping, Sequence
 
 import pandas as pd
@@ -33,6 +33,16 @@ def evaluate_walk_forward_variants(
         raise ValueError("at least one walk-forward fold is required")
     if initial_equity <= 0:
         raise ValueError("initial_equity must be positive")
+    previous_test_end = None
+    for fold in folds:
+        test_start = fold.validation_end + fold.embargo
+        if test_start >= fold.out_of_sample_end:
+            raise ValueError("walk-forward OOS period must be positive")
+        if previous_test_end is not None and test_start < previous_test_end:
+            raise ValueError(
+                "walk-forward OOS folds must not overlap when compounding equity"
+            )
+        previous_test_end = fold.out_of_sample_end
     suite = ResearchVariantSuite()
     instruments_by_id = {item.product_id: item for item in instruments}
     signals: dict[str, list] = {
@@ -129,13 +139,14 @@ def evaluate_walk_forward_variants(
     }
     for variant_id, variant_signals in signals.items():
         fold_results = []
+        variant_equity = initial_equity
         oos_signal_products: set[str] = set()
         for fold_index, fold in enumerate(folds):
-            exit_boundary = fold.out_of_sample_end + timedelta(seconds=60)
+            exit_boundary = fold.out_of_sample_end
             test_start = fold.validation_end + fold.embargo
             candidates = [
                 signal for signal in variant_signals
-                if test_start <= signal.decision_time <= fold.out_of_sample_end
+                if test_start <= signal.decision_time < fold.out_of_sample_end
             ]
             oos_signal_products.update(signal.product_id for signal in candidates)
             candles_1m = {
@@ -149,9 +160,10 @@ def evaluate_walk_forward_variants(
                 candidates,
                 instruments_by_id,
                 candles_1m,
-                initial_equity,
+                variant_equity,
                 max_exit_time=exit_boundary,
             )
+            variant_equity = portfolio.final_equity
             per_symbol = {}
             for instrument in instruments:
                 symbol_outcomes = [
@@ -194,6 +206,7 @@ def evaluate_walk_forward_variants(
                     "status": portfolio.status,
                     "initial_equity": portfolio.initial_equity,
                     "final_equity": portfolio.final_equity,
+                    "compounded_oos_equity": variant_equity,
                     "net_pnl": portfolio.net_pnl,
                     "max_drawdown_pct": portfolio.realized_max_drawdown_pct,
                     "accepted_count": portfolio.accepted_count,
@@ -229,13 +242,14 @@ def evaluate_walk_forward_variants(
 
     selector = ValidatedStrategySelector()
     selection_folds = []
+    selector_equity = initial_equity
     for fold_index, fold in enumerate(folds):
         validation_start = fold.train_end + fold.embargo
         validation_candidates = [
             signal
             for variant_signals in signals.values()
             for signal in variant_signals
-            if validation_start <= signal.decision_time <= fold.validation_end
+            if validation_start <= signal.decision_time < fold.validation_end
         ]
         validation_regimes = {
             signal_key(signal): _regime_at(
@@ -244,7 +258,7 @@ def evaluate_walk_forward_variants(
             for signal in validation_candidates
         }
         validation_outcomes = []
-        validation_exit_boundary = fold.validation_end + timedelta(seconds=60)
+        validation_exit_boundary = fold.validation_end
         validation_candles = {
             product_id: [
                 candle for candle in candles
@@ -255,7 +269,7 @@ def evaluate_walk_forward_variants(
         for variant_id, variant_signals in signals.items():
             candidates = [
                 signal for signal in variant_signals
-                if validation_start <= signal.decision_time <= fold.validation_end
+                if validation_start <= signal.decision_time < fold.validation_end
             ]
             if candidates:
                 validation_portfolio = simulator.simulate(
@@ -274,7 +288,7 @@ def evaluate_walk_forward_variants(
             signal
             for variant_signals in signals.values()
             for signal in variant_signals
-            if test_start <= signal.decision_time <= fold.out_of_sample_end
+            if test_start <= signal.decision_time < fold.out_of_sample_end
         ]
         oos_regimes = {
             signal_key(signal): _regime_at(
@@ -283,7 +297,7 @@ def evaluate_walk_forward_variants(
             for signal in oos_candidates
         }
         selection = selector.select(oos_candidates, evidence, oos_regimes)
-        oos_exit_boundary = fold.out_of_sample_end + timedelta(seconds=60)
+        oos_exit_boundary = fold.out_of_sample_end
         oos_candles = {
             product_id: [
                 candle for candle in candles
@@ -295,9 +309,10 @@ def evaluate_walk_forward_variants(
             selection.selected,
             instruments_by_id,
             oos_candles,
-            initial_equity,
+            selector_equity,
             max_exit_time=oos_exit_boundary,
         )
+        selector_equity = selected_portfolio.final_equity
         selection_folds.append({
             "fold": fold_index,
             "train_end": fold.train_end.isoformat(),
@@ -313,6 +328,7 @@ def evaluate_walk_forward_variants(
                 "status": selected_portfolio.status,
                 "initial_equity": selected_portfolio.initial_equity,
                 "final_equity": selected_portfolio.final_equity,
+                "compounded_oos_equity": selector_equity,
                 "net_pnl": selected_portfolio.net_pnl,
                 "max_drawdown_pct": selected_portfolio.realized_max_drawdown_pct,
                 "accepted_count": selected_portfolio.accepted_count,
@@ -338,6 +354,7 @@ def evaluate_walk_forward_variants(
         "coverage": data_status,
         "limitations": [
             "Standalone fold metrics are OOS; the combined selector is fitted only from simulated validation-period net outcomes and must not be tuned using its OOS folds.",
+            "Standalone and selector equity compound sequentially across non-overlapping OOS folds; within-fold positions are settled at fold end and no overlapping OOS periods are permitted.",
             "OHLCV fills use the constrained paper simulator; depth/impact, funding, liquidation, and correlation stress are not modeled.",
             "Strategy selection uses only simulated validation outcomes grouped by per-symbol OHLCV regime; minimum samples and positive net expectancy are required, otherwise it selects no trade.",
             "Portfolio risk is bounded by open slots, notional, stop risk, same-product overlap, and a recent aligned-return correlation gate; the gate is not a full correlation stress model.",
