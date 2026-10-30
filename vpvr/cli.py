@@ -14,6 +14,7 @@ import pandas as pd
 from .config import VPVRConfig
 from .data import DeltaMarketData, MarketDataError
 from .engine import VPVREngine
+from .profile import build_volume_profile
 from .risk import RiskEngine
 from .paper import PaperBroker
 from .backtest import run_backtest, BacktestConfig
