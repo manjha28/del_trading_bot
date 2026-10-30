@@ -2,3 +2,5 @@ delta-rest-client
 pandas
 python-dotenv
 requests
+numpy
+websocket-client>=1.8,<2

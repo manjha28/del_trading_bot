@@ -1,21 +1,16 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 *.log
 *.csv
-
-# Virtual env
+.pytest_cache/
+.mypy_cache/
 .venv/
 venv/
-
-# IDE
 .idea/
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Secrets
 .env
+# VPVR runtime state and backtest outputs
+data/
+*.sqlite3
