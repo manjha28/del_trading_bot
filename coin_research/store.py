@@ -345,7 +345,7 @@ class ResearchStore:
                     continue
                 exit_price = float(candidates.iloc[0].close)
                 gross_return = (
-                    (reference / exit_price - 1) * 100
+                    (reference - exit_price) / reference * 100
                     if direction == "bearish_research_only"
                     else (exit_price / reference - 1) * 100
                 )
