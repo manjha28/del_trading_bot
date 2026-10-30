@@ -30,8 +30,8 @@ class DeltaPublicStream:
         self._reconnects = 0
 
     def subscription(self):
-        names = ("ticker", "trades", "funding_rate", "ob_l2",
-                 "candlesticks_1m", "candlesticks_3m", "candlesticks_15m")
+        names = ("ticker", "trades", "funding_rate", "ob_l1", "ob_l2",
+                 "candlestick_1m", "candlestick_3m", "candlestick_15m")
         return {"type": "subscribe", "payload": {"channels": [
             {"name": name, "symbols": self.symbols} for name in names
         ]}}
@@ -52,6 +52,7 @@ class DeltaPublicStream:
     def _on_open(self, ws):
         self._connected = True
         self._last_error = None
+        ws.send(json.dumps({"type": "enable_heartbeat"}))
         ws.send(json.dumps(self.subscription()))
 
     def _on_close(self, ws, code, message):
@@ -71,6 +72,19 @@ class DeltaPublicStream:
         if kind in ("subscriptions", "heartbeat", "pong"):
             return
         symbol = data.get("sy") or data.get("symbol") or data.get("product_symbol")
+        if kind == "ticker":
+            # Current Delta ticker payload is compact: d[] rows and q[ask, ask_size, bid, bid_size].
+            rows = data.get("d") or []
+            row = next((item for item in rows if item.get("s") == symbol), rows[0] if rows else {})
+            if row:
+                quote = row.get("q") or []
+                if len(quote) >= 4:
+                    data = {**data, "best_ask": quote[0], "best_bid": quote[2],
+                            "ask_size": quote[1], "bid_size": quote[3]}
+                data = {**data, "mark_price": row.get("m"),
+                        "turnover_usd": (row.get("to") or [None, None])[1]}
+        if kind == "mark_price" and symbol and str(symbol).startswith("MARK:"):
+            symbol = str(symbol)[6:]
         if not symbol:
             return
         event = {"type": kind, "symbol": symbol, "received_at": time.time(), "raw": data}
@@ -81,25 +95,38 @@ class DeltaPublicStream:
                              aggressor_side=None)
             except (KeyError, TypeError, ValueError):
                 return
-            key = (symbol, event["timestamp_us"], event["price"], event["volume"], event["buyer_role"])
-            with self._lock:
-                if key in self._seen:
-                    return
-                self._seen.add(key)
-                if len(self._seen) > self.max_events * 2:
-                    self._seen.clear()
-        elif kind and kind.startswith("candlesticks_"):
+            # buyer_role is maker/taker, not an explicit REST aggressor-side field.
+            # Only deduplicate when Delta supplies a stable trade identifier.
+            trade_id = data.get("id") or data.get("trade_id") or data.get("i")
+            if trade_id is not None:
+                key = (symbol, str(trade_id))
+                with self._lock:
+                    if key in self._seen:
+                        return
+                    self._seen.add(key)
+                    if len(self._seen) > self.max_events * 2:
+                        self._seen.clear()
+        elif kind and kind.startswith("candlestick_"):
             try:
-                event.update(time=int(data.get("t") or data.get("time")),
-                             open=float(data.get("o") or data.get("open")),
-                             high=float(data.get("h") or data.get("high")),
-                             low=float(data.get("l") or data.get("low")),
-                             close=float(data.get("c") or data.get("close")),
-                             volume=float(data.get("v") or data.get("volume")))
-            except (TypeError, ValueError):
+                resolution = data.get("res") or kind.removeprefix("candlestick_")
+                seconds = {"1m": 60, "3m": 180, "5m": 300, "15m": 900,
+                           "30m": 1800, "1h": 3600}.get(resolution)
+                raw_ts = data.get("t") or data.get("time") or data.get("ts")
+                stamp = int(raw_ts)
+                # Delta's current public stream publishes ts/t in microseconds.
+                stamp_seconds = stamp / 1_000_000 if stamp > 10**14 else stamp / 1_000 if stamp > 10**11 else stamp
+                if seconds is None:
+                    return
+                candle_start = int(stamp_seconds // seconds * seconds)
+                event.update(time=candle_start, resolution=resolution,
+                             open=float(data["o"]), high=float(data["h"]),
+                             low=float(data["l"]), close=float(data["c"]),
+                             volume=float(data["v"]))
+            except (KeyError, TypeError, ValueError):
                 return
         elif kind == "ticker":
-            for name in ("mark_price", "close", "best_bid", "best_ask", "turnover", "funding_rate"):
+            for name in ("mark_price", "close", "best_bid", "best_ask", "turnover", "turnover_usd",
+                         "ask_size", "bid_size"):
                 if data.get(name) is not None:
                     try:
                         event[name] = float(data[name])
@@ -108,11 +135,20 @@ class DeltaPublicStream:
         elif kind == "funding_rate":
             try:
                 event["funding_rate"] = float(data["fr"])
-                event["next_funding_us"] = int(data.get("nfr", 0))
+                event["funding_interval_seconds"] = int(data["fi"])
+                event["next_funding_us"] = int(data["nfr"])
+                event["next_funding_at"] = event["next_funding_us"] / 1_000_000
             except (KeyError, TypeError, ValueError):
                 return
-        elif kind in ("ob_l2", "ob_updates"):
-            event["book"] = data
+        elif kind == "ob_l1":
+            try:
+                event.update(best_ask=float(data["ap"]), ask_size=float(data["as"]),
+                             best_bid=float(data["bp"]), bid_size=float(data["bs"]))
+            except (KeyError, TypeError, ValueError):
+                return
+        elif kind == "ob_l2":
+            event["book"] = {"sell": [{"price": level[0], "size": level[1]} for level in data.get("a", [])],
+                             "buy": [{"price": level[0], "size": level[1]} for level in data.get("b", [])]}
         self._publish(event)
 
     def _worker(self):
