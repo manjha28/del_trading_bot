@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote
 
 from .market_data import (
     Candle,
@@ -17,7 +18,7 @@ from .market_data import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _json(value: object) -> str:
@@ -40,13 +41,22 @@ def _datetime(value: str) -> datetime:
 class ResearchDataStore:
     """Versioned persistence for canonical research data; no order/execution state."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, read_only: bool = False):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.path, timeout=10)
+        if read_only:
+            if not self.path.is_file():
+                raise FileNotFoundError(f"research database does not exist: {self.path}")
+            uri = f"file:{quote(str(self.path.resolve()))}?mode=ro"
+            self.connection = sqlite3.connect(uri, uri=True, timeout=10)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.connection = sqlite3.connect(self.path, timeout=10)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
-        self._initialize()
+        if read_only:
+            self.connection.execute("PRAGMA query_only = ON")
+        else:
+            self._initialize()
 
     def __enter__(self) -> ResearchDataStore:
         return self
@@ -155,8 +165,33 @@ class ResearchDataStore:
             );
             CREATE INDEX IF NOT EXISTS data_quality_lookup_idx
                 ON data_quality(product_id,data_type,observed_at DESC);
+            CREATE TABLE IF NOT EXISTS experiments (
+                experiment_id TEXT PRIMARY KEY,
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                dataset_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                split_json TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS experiments_created_idx
+                ON experiments(created_at DESC);
+            CREATE TABLE IF NOT EXISTS paper_simulations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_id TEXT REFERENCES experiments(experiment_id),
+                strategy_id TEXT NOT NULL,
+                product_id TEXT NOT NULL REFERENCES instruments(product_id),
+                symbol TEXT NOT NULL,
+                decision_time TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS paper_simulations_time_idx
+                ON paper_simulations(decision_time DESC);
         """)
-        if version == 0:
+        if version < SCHEMA_VERSION:
             self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.connection.commit()
 
@@ -218,6 +253,124 @@ class ResearchDataStore:
             for row in rows
         ]
 
+    def dashboard_summary(self) -> dict:
+        counts = {
+            row["state"]: row["count"] for row in self.connection.execute("""
+                SELECT state,COUNT(*) AS count FROM instruments GROUP BY state
+            """)
+        }
+        data_counts = {
+            row["data_type"]: row["count"] for row in self.connection.execute("""
+                SELECT q.data_type,COUNT(*) AS count
+                FROM (
+                    SELECT data_type,product_id,MAX(id) AS latest_id
+                    FROM data_quality GROUP BY data_type,product_id
+                ) latest
+                JOIN data_quality q ON q.id=latest.latest_id
+                GROUP BY q.data_type
+            """)
+        }
+        latest_capture = self.connection.execute("""
+            SELECT MAX(observed_at) AS value FROM tickers
+        """).fetchone()["value"]
+        return {
+            **self.coverage_summary(),
+            "instrument_states": counts,
+            "latest_quality_coverage": data_counts,
+            "latest_ticker_time": latest_capture,
+        }
+
+    def list_instrument_rows(
+        self, search: str = "", state: str = "", limit: int = 100, offset: int = 0
+    ) -> dict:
+        if limit < 1 or offset < 0:
+            raise ValueError("limit must be positive and offset non-negative")
+        conditions = []
+        params: list[object] = []
+        if search.strip():
+            conditions.append("lower(i.symbol) LIKE ?")
+            params.append(f"%{search.strip().casefold()}%")
+        if state:
+            conditions.append("i.state=?")
+            params.append(state)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        count = self.connection.execute(
+            f"SELECT COUNT(*) FROM instruments i{where}", params
+        ).fetchone()[0]
+        rows = self.connection.execute(f"""
+            SELECT i.product_id,i.symbol,i.contract_type,i.state,i.first_seen,
+                   i.last_seen,i.last_reconciled,i.metadata_json,
+                   (SELECT MAX(c.start_time) FROM candles c
+                    WHERE c.product_id=i.product_id) AS latest_candle_time,
+                   (SELECT COUNT(*) FROM candles c
+                    WHERE c.product_id=i.product_id) AS candle_count,
+                   (SELECT MAX(t.observed_at) FROM tickers t
+                    WHERE t.product_id=i.product_id) AS latest_ticker_time,
+                   (SELECT t.last_price FROM tickers t
+                    WHERE t.product_id=i.product_id
+                    ORDER BY t.observed_at DESC,t.id DESC LIMIT 1) AS last_price,
+                   (SELECT t.volume_24h_notional FROM tickers t
+                    WHERE t.product_id=i.product_id
+                    ORDER BY t.observed_at DESC,t.id DESC LIMIT 1) AS notional_24h
+            FROM instruments i{where}
+            ORDER BY i.symbol,i.product_id LIMIT ? OFFSET ?
+        """, (*params, limit, offset)).fetchall()
+        return {
+            "items": [
+                dict(row) | {"metadata": json.loads(row["metadata_json"])}
+                for row in rows
+            ],
+            "total": count,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def instrument_detail(self, product_id: str) -> dict | None:
+        row = self.connection.execute("""
+            SELECT product_id,symbol,contract_type,state,first_seen,last_seen,
+                   last_reconciled,metadata_json
+            FROM instruments WHERE product_id=?
+        """, (str(product_id),)).fetchone()
+        if row is None:
+            return None
+        instrument = dict(row) | {"metadata": json.loads(row["metadata_json"])}
+        instrument.pop("metadata_json")
+        instrument["data_quality"] = [
+            dict(item) | {"reasons": json.loads(item["reasons_json"])}
+            for item in self.connection.execute("""
+                SELECT data_type,state,observed_at,source,completeness,reasons_json
+                FROM data_quality WHERE product_id=? ORDER BY observed_at DESC,id DESC
+            """, (str(product_id),)).fetchall()
+        ]
+        latest_ticker = self.connection.execute("""
+            SELECT observed_at,source,last_price,mark_price,index_price,
+                   volume_24h_notional,raw_json
+            FROM tickers WHERE product_id=? ORDER BY observed_at DESC,id DESC LIMIT 1
+        """, (str(product_id),)).fetchone()
+        instrument["latest_ticker"] = None
+        if latest_ticker is not None:
+            ticker = dict(latest_ticker)
+            ticker["raw"] = json.loads(ticker.pop("raw_json"))
+            instrument["latest_ticker"] = ticker
+        latest_book = self.connection.execute("""
+            SELECT observed_at,exchange_timestamp,source,sequence,integrity,
+                   bids_json,asks_json
+            FROM order_books WHERE product_id=? ORDER BY observed_at DESC,id DESC LIMIT 1
+        """, (str(product_id),)).fetchone()
+        instrument["latest_book"] = None
+        if latest_book is not None:
+            book = dict(latest_book)
+            book["bids"] = json.loads(book.pop("bids_json"))
+            book["asks"] = json.loads(book.pop("asks_json"))
+            instrument["latest_book"] = book
+        instrument["funding"] = [
+            dict(item) for item in self.connection.execute("""
+                SELECT timestamp,rate,source FROM funding
+                WHERE product_id=? ORDER BY timestamp DESC LIMIT 100
+            """, (str(product_id),)).fetchall()
+        ]
+        return instrument
+
     def save_candles(self, candles: Iterable[Candle]) -> None:
         rows = [(
             item.product_id, item.timeframe, _iso(item.start_time), item.open,
@@ -271,6 +424,17 @@ class ResearchDataStore:
             )
             for row in rows
         ]
+
+    def list_candle_rows(self, product_id: str, timeframe: str, limit: int = 500) -> list[dict]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        rows = self.connection.execute("""
+            SELECT start_time,open,high,low,close,volume,volume_unit,source,
+                   is_complete,is_derived
+            FROM candles WHERE product_id=? AND timeframe=?
+            ORDER BY start_time DESC LIMIT ?
+        """, (str(product_id), timeframe, limit)).fetchall()
+        return [dict(row) for row in reversed(rows)]
 
     def save_tickers(self, tickers: Iterable[TickerSnapshot]) -> None:
         rows = [(
@@ -337,6 +501,102 @@ class ResearchDataStore:
                 quality.source, quality.completeness, _json(list(quality.reasons)),
             ))
 
+    def save_experiment(
+        self,
+        experiment_id: str,
+        strategy_id: str,
+        strategy_version: str,
+        dataset_version: str,
+        split: dict,
+        config: dict,
+        metrics: dict | None = None,
+        status: str = "registered",
+        created_at: datetime | None = None,
+    ) -> None:
+        if not all((experiment_id.strip(), strategy_id.strip(), strategy_version.strip(),
+                    dataset_version.strip(), status.strip())):
+            raise ValueError("experiment identity, versions, and status are required")
+        timestamp = _iso(created_at or datetime.now(timezone.utc))
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO experiments
+                (experiment_id,strategy_id,strategy_version,dataset_version,created_at,
+                 split_json,config_json,metrics_json,status)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(experiment_id) DO UPDATE SET
+                strategy_id=excluded.strategy_id,strategy_version=excluded.strategy_version,
+                dataset_version=excluded.dataset_version,split_json=excluded.split_json,
+                config_json=excluded.config_json,metrics_json=excluded.metrics_json,
+                status=excluded.status
+            """, (
+                experiment_id, strategy_id, strategy_version, dataset_version, timestamp,
+                _json(split), _json(config), _json(metrics or {}), status,
+            ))
+
+    def list_experiments(self, limit: int = 100, offset: int = 0) -> dict:
+        if limit < 1 or offset < 0:
+            raise ValueError("limit must be positive and offset non-negative")
+        total = self.connection.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
+        rows = self.connection.execute("""
+            SELECT experiment_id,strategy_id,strategy_version,dataset_version,
+                   created_at,split_json,config_json,metrics_json,status
+            FROM experiments ORDER BY created_at DESC,experiment_id LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+        return {
+            "items": [
+                dict(row) | {
+                    "split": json.loads(row["split_json"]),
+                    "config": json.loads(row["config_json"]),
+                    "metrics": json.loads(row["metrics_json"]),
+                }
+                for row in rows
+            ],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def save_paper_simulation(self, result, experiment_id: str | None = None) -> None:
+        payload = result.__dict__ if hasattr(result, "__dict__") else dict(result)
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO paper_simulations
+                (experiment_id,strategy_id,product_id,symbol,decision_time,status,result_json)
+                VALUES (?,?,?,?,?,?,?)
+            """, (
+                experiment_id, payload["strategy_id"], payload["product_id"], payload["symbol"],
+                payload["decision_time"], payload["status"], _json(payload),
+            ))
+
+    def list_paper_simulations(
+        self, limit: int = 100, offset: int = 0, symbol: str | None = None
+    ) -> dict:
+        if limit < 1 or offset < 0:
+            raise ValueError("limit must be positive and offset non-negative")
+        conditions = []
+        params: list[object] = []
+        if symbol:
+            conditions.append("symbol=?")
+            params.append(symbol)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        total = self.connection.execute(
+            f"SELECT COUNT(*) FROM paper_simulations{where}", params
+        ).fetchone()[0]
+        rows = self.connection.execute(f"""
+            SELECT id,experiment_id,strategy_id,product_id,symbol,decision_time,status,result_json
+            FROM paper_simulations{where}
+            ORDER BY decision_time DESC,id DESC LIMIT ? OFFSET ?
+        """, (*params, limit, offset)).fetchall()
+        return {
+            "items": [
+                dict(row) | {"result": json.loads(row["result_json"])}
+                for row in rows
+            ],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
     def coverage_summary(self) -> dict:
         product_counts = {
             row["state"]: row["count"] for row in self.connection.execute("""
@@ -361,5 +621,11 @@ class ResearchDataStore:
             ).fetchone()[0],
             "funding_observation_count": self.connection.execute(
                 "SELECT COUNT(*) FROM funding"
+            ).fetchone()[0],
+            "experiment_count": self.connection.execute(
+                "SELECT COUNT(*) FROM experiments"
+            ).fetchone()[0],
+            "paper_simulation_count": self.connection.execute(
+                "SELECT COUNT(*) FROM paper_simulations"
             ).fetchone()[0],
         }

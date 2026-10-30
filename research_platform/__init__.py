@@ -29,6 +29,8 @@ from .strategies import (
     StrategySpecification,
     VPVRStrategyAdapter,
 )
+from .simulation import PaperSimulationConfig, PaperSimulator, PaperTradeResult
+from .validation import ChronologicalPeriods, chronological_split, summarize_paper_results
 
 __all__ = [
     "BookLevel",
@@ -43,6 +45,9 @@ __all__ = [
     "MHRExhaustionAdapter",
     "MarketDataProvider",
     "OrderBookSnapshot",
+    "PaperSimulationConfig",
+    "PaperSimulator",
+    "PaperTradeResult",
     "ProviderCapabilities",
     "ResearchCollector",
     "ResearchDataStore",
@@ -51,9 +56,12 @@ __all__ = [
     "StrategyContext",
     "StrategySignal",
     "StrategySpecification",
+    "ChronologicalPeriods",
     "TickerSnapshot",
     "TradePrint",
     "UnsupportedCapabilityError",
     "VPVRDataAdapter",
     "VPVRStrategyAdapter",
+    "chronological_split",
+    "summarize_paper_results",
 ]

@@ -145,3 +145,11 @@ class ResearchCollector:
             source=self.provider.capabilities.provider,
             reasons=("provider capability is not available",),
         ))
+
+    def record_failure(self, instrument: Instrument, data_type: str, error: Exception) -> None:
+        self.store.save_quality(instrument.product_id, data_type, DataQuality(
+            state="partial",
+            observed_at=datetime.now(timezone.utc),
+            source=self.provider.capabilities.provider,
+            reasons=(f"{type(error).__name__}: {error}",),
+        ))
