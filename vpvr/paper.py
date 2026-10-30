@@ -1,8 +1,8 @@
 """Persistent deterministic paper broker. Contains NO exchange order API calls.
 
-Strategy signals are stop-entry triggers. They are eligible only on a later
-completed 1m candle. Stops take priority if stop and target touch in the same
-bar because OHLCV cannot reveal intrabar path order.
+Signals are stop-entry triggers. They can fill only on a later completed 1m
+bar. Stops take priority if both stop and target touch in one bar because the
+intrabar path cannot be inferred from OHLCV.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass
@@ -33,18 +33,25 @@ class PaperPosition:
     funding_paid: float = 0.0
     last_funding_at: str | None = None
     last_mark: float | None = None
+    last_candle_low: float | None = None
+    last_candle_high: float | None = None
     regime: str = "uncertain_no_trade"
 
 
 class PaperBroker:
     def __init__(self, path="data/vpvr_paper_state.json", initial_balance=1000.0,
-                 fee_rate=0.0005, slippage_bps=2.0, max_chase_bps=10.0):
+                 fee_rate=0.0005, slippage_bps=2.0, max_chase_bps=10.0,
+                 trailing_buffer_pct=0.001, max_hold_minutes=180):
         if initial_balance <= 0 or fee_rate < 0 or slippage_bps < 0 or max_chase_bps < 0:
             raise ValueError("invalid paper broker configuration")
+        if trailing_buffer_pct < 0 or max_hold_minutes < 1:
+            raise ValueError("invalid trailing/holding configuration")
         self.path = Path(path)
         self.fee_rate = float(fee_rate)
         self.slippage_bps = float(slippage_bps)
         self.max_chase_bps = float(max_chase_bps)
+        self.trailing_buffer_pct = float(trailing_buffer_pct)
+        self.max_hold_minutes = int(max_hold_minutes)
         self.initial_balance = float(initial_balance)
         self.state = self._load()
 
@@ -132,17 +139,27 @@ class PaperBroker:
         position = self.state["positions"].get(symbol)
         if position:
             position["last_mark"] = close
+            # Once target 2 is booked, trail the remaining runner behind the prior
+            # completed candle's structural low/high; stops may only tighten.
+            if position["target_index"] >= 2 and position["remaining"] > 1e-10:
+                prior_low = position.get("last_candle_low")
+                prior_high = position.get("last_candle_high")
+                if position["direction"] == "LONG" and prior_low is not None:
+                    position["stop"] = max(position["stop"], float(prior_low) * (1 - self.trailing_buffer_pct))
+                elif position["direction"] == "SHORT" and prior_high is not None:
+                    position["stop"] = min(position["stop"], float(prior_high) * (1 + self.trailing_buffer_pct))
             self._apply_funding(position, timestamp, funding_rate, events)
             direction = position["direction"]
             stop_hit = low <= position["stop"] if direction == "LONG" else high >= position["stop"]
             if stop_hit:
                 fill = position["stop"] * (1 - self.slippage_bps / 10000 if direction == "LONG"
                                            else 1 + self.slippage_bps / 10000)
-                self._close(symbol, fill, "STOP", timestamp, events)
+                self._close(symbol, fill, "STOP_OR_TRAIL", timestamp, events)
                 self._save()
                 return events
+
             targets = position["targets"]
-            fractions = [1.0] if len(targets) == 1 else ([0.30, 0.70] if len(targets) == 2 else [0.30, 0.45, 0.25])
+            fractions = [1.0] if len(targets) == 1 else ([0.30, 0.45] if len(targets) == 2 else [0.30, 0.45, 0.25])
             while position["target_index"] < len(targets):
                 index = position["target_index"]
                 target = float(targets[index])
@@ -169,6 +186,13 @@ class PaperBroker:
             if position["remaining"] <= 1e-10:
                 self._finish(symbol, timestamp, float(targets[-1]), "TARGETS")
                 events.append({"symbol": symbol, "event": "closed", "reason": "TARGETS"})
+            elif (timestamp - pd.Timestamp(position["opened_at"])).total_seconds() / 60 >= self.max_hold_minutes:
+                self._close(symbol, close * (1 - self.slippage_bps / 10000 if direction == "LONG"
+                                             else 1 + self.slippage_bps / 10000),
+                            "TIMEOUT", timestamp, events)
+            elif symbol in self.state["positions"]:
+                position["last_candle_low"] = low
+                position["last_candle_high"] = high
             self._save()
             return events
 
@@ -197,17 +221,17 @@ class PaperBroker:
             reference = max(entry, open_price) if direction == "LONG" else min(entry, open_price)
             fill = reference * (1 + self.slippage_bps / 10000 if direction == "LONG"
                                 else 1 - self.slippage_bps / 10000)
-            qty, mult = float(pending["quantity"]), float(pending["contract_multiplier"])
-            fee = abs(fill * qty * mult) * self.fee_rate
-            pos = PaperPosition(
+            qty, multiplier = float(pending["quantity"]), float(pending["contract_multiplier"])
+            fee = abs(fill * qty * multiplier) * self.fee_rate
+            position = asdict(PaperPosition(
                 symbol=symbol, strategy=pending["strategy"], direction=direction, entry=fill,
                 stop=stop, targets=list(pending["targets"]), quantity=qty, remaining=qty,
-                opened_at=timestamp.isoformat(), entry_fee=fee, contract_multiplier=mult,
+                opened_at=timestamp.isoformat(), entry_fee=fee, contract_multiplier=multiplier,
                 fees=fee, realized_pnl=-fee, last_funding_at=timestamp.isoformat(),
-                last_mark=fill, regime=pending["regime"]
-            )
+                last_mark=fill, last_candle_low=low, last_candle_high=high, regime=pending["regime"]
+            ))
             self.state["balance"] -= fee
-            self.state["positions"][symbol] = asdict(pos)
+            self.state["positions"][symbol] = position
             self.state["pending"].pop(key)
             events.append({"symbol": symbol, "event": "entry_filled", "price": fill,
                            "quantity": qty, "entry_fee": fee})
@@ -223,7 +247,6 @@ class PaperBroker:
             return
         rate = float(funding_rate)
         notional = position["remaining"] * position["entry"] * position["contract_multiplier"]
-        # Positive funding: longs pay shorts receive.
         cash_flow = -notional * rate * periods if position["direction"] == "LONG" else notional * rate * periods
         position["funding_paid"] += -cash_flow
         position["realized_pnl"] += cash_flow
