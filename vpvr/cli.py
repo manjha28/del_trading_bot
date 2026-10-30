@@ -111,6 +111,14 @@ def scan_once(symbols, paper=False, config=None):
             funding=ticker.get("funding_rate")
             try: funding=float(funding) if funding is not None else None
             except (TypeError,ValueError): funding=None
+            if funding is None:
+                output.append({"symbol":symbol,"status":"no_trade_funding_rate_unavailable",
+                    "reason":"funding-rate filter cannot be evaluated"})
+                continue
+            if abs(funding)>cfg.max_abs_funding_rate:
+                output.append({"symbol":symbol,"status":"no_trade_funding_rate_exceeded",
+                    "funding_rate":funding,"max_abs_funding_rate":cfg.max_abs_funding_rate})
+                continue
 
             # Process fresh, unique completed 1m bars and reconcile any closes into risk state.
             trade_count_before=len(broker.state["trades"])
