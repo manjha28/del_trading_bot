@@ -179,7 +179,7 @@ class PaperBroker:
                 position["target_index"] += 1
                 if index == 0:
                     position["stop"] = position["entry"]
-                elif index == 1 and len(targets) >= 3:
+                elif index == 1:
                     position["stop"] = float(targets[0])
                 events.append({"symbol": symbol, "event": "partial_target", "target": target,
                                "quantity": qty, "net_pnl": net})
