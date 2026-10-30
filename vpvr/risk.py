@@ -44,7 +44,8 @@ class RiskEngine:
 
     def size(self,*,equity:float,entry:float,stop:float,direction:str,leverage:float=10,
              contract_multiplier:float|None=1.0,lot_size:float|None=1.0,min_qty:float|None=1.0,
-             tick_size:float|None=None,fee_rate:float=0.0,slippage_bps:float=0.0)->RiskDecision:
+             tick_size:float|None=None,fee_rate:float=0.0,slippage_bps:float=0.0,
+             max_qty:float|None=None)->RiskDecision:
         if self.daily_start_equity is None:
             self.reset_day(equity)
         self.current_equity=float(equity)
@@ -82,6 +83,10 @@ class RiskEngine:
             return RiskDecision(False,"invalid risk per contract")
         risk_budget=equity*self.config.risk_per_trade_pct
         qty=math.floor((risk_budget/risk_per_contract)/lot_size)*lot_size
+        if max_qty is not None:
+            if max_qty <= 0:
+                return RiskDecision(False,"invalid exchange position-size limit")
+            qty=min(qty,math.floor(max_qty/lot_size)*lot_size)
         # Never round up to the exchange minimum: that could exceed risk.
         if qty+1e-12<min_qty:
             return RiskDecision(False,"risk-sized quantity below exchange minimum")
