@@ -13,10 +13,7 @@ from pathlib import Path
 import pandas as pd
 from .config import VPVRConfig
 from .data import DeltaMarketData, MarketDataError
-from .indicators import cumulative_volume_delta, trade_delta_bars, delta_divergence
-from .profile import build_volume_profile, rolling_profiles
-from .regime import classify_regime
-from .strategies import generate_signals
+from .engine import VPVREngine
 from .risk import RiskEngine
 from .paper import PaperBroker
 from .backtest import run_backtest, BacktestConfig
@@ -124,35 +121,13 @@ def scan_once(symbols, paper=False, config=None):
             equity=broker.equity(marks)
             risk.update_equity(equity,today)
 
-            profile_frame=frames["15m"].tail(cfg.profile_lookback_15m)
-            profile_start=pd.Timestamp(profile_frame.time.iloc[0])
-            profile_end=pd.Timestamp(profile_frame.time.iloc[-1])+pd.Timedelta(minutes=15)
-            # True trade-level VP is used only when the REST tape covers the entire
-            # requested profile window. Otherwise use a prominently labeled OHLCV estimate.
             try:
                 trades=data.fetch_public_trades(symbol)
             except MarketDataError:
                 trades=pd.DataFrame(columns=["time","price","volume","side"])
-            tape_covers_window=(not trades.empty and trades.time.min()<=profile_start and
-                                trades.time.max()>=profile_end-pd.Timedelta(minutes=1))
-            if tape_covers_window:
-                profile=build_volume_profile(trades=trades.loc[(trades.time>=profile_start)&(trades.time<profile_end)],
-                    rows=cfg.profile_rows,value_area_pct=cfg.value_area_pct,
-                    smoothing_window=cfg.node_smoothing_window,node_threshold_pct=cfg.node_threshold_pct)
-            else:
-                profile=build_volume_profile(profile_frame,rows=cfg.profile_rows,
-                    value_area_pct=cfg.value_area_pct,smoothing_window=cfg.node_smoothing_window,
-                    node_threshold_pct=cfg.node_threshold_pct)
-            profile_history=rolling_profiles(frames["15m"].tail(96),rows=cfg.profile_rows,
-                value_area_pct=cfg.value_area_pct,window=32,step=16,
-                smoothing_window=cfg.node_smoothing_window,node_threshold_pct=cfg.node_threshold_pct)
-            regime=classify_regime(frames["15m"],frames["3m"],profile,profile_history)
-            signals=generate_signals(symbol,frames["1m"],frames["3m"],frames["15m"],
-                profile,regime,cfg.min_reward_risk,cfg.min_volume_multiple)
-
-            cvd=cumulative_volume_delta(trades)
-            delta_bars=trade_delta_bars(trades,"1min")
-            divergence=delta_divergence(frames["1m"].tail(10),delta_bars.tail(10),lookback=10)
+            analysis=VPVREngine(cfg).analyse(symbol,frames["1m"],frames["3m"],frames["15m"],trades)
+            profile,regime,signals=analysis.profile,analysis.regime,list(analysis.signals)
+            diagnostics=analysis.diagnostics
             specs=data.contract_specs(product)
             if specs is None:
                 output.append({"symbol":symbol,"status":"contract_metadata_incomplete",
@@ -187,8 +162,7 @@ def scan_once(symbols, paper=False, config=None):
             output.append({"symbol":symbol,"status":"ok",
                 "regime":{"name":regime.regime.value,"confidence":regime.confidence,"reasons":regime.reasons},
                 "profile":profile.as_dict(),"spread_pct":spread,"funding_rate":funding,
-                "cvd":cvd,"delta_divergence":divergence,
-                "trade_tape_covers_profile_window":tape_covers_window,
+                "indicators":diagnostics,
                 "contract_specs":specs,"paper_events":paper_events,"signals":signal_rows})
         except (MarketDataError,ValueError,KeyError) as exc:
             output.append({"symbol":symbol,"status":"data_or_signal_error","reason":str(exc)})
