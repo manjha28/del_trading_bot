@@ -1,51 +1,262 @@
-"""Persistent deterministic paper trading. This module contains no exchange order API calls."""
+"""Persistent deterministic paper broker. Contains NO exchange order API calls.
+
+Strategy signals are stop-entry triggers. They are eligible only on a later
+completed 1m candle. Stops take priority if stop and target touch in the same
+bar because OHLCV cannot reveal intrabar path order.
+"""
 from __future__ import annotations
-from dataclasses import dataclass,asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-import json,os,tempfile
+import json
+import os
+import tempfile
 import pandas as pd
+
 
 @dataclass
 class PaperPosition:
-    symbol:str; strategy:str; direction:str; entry:float; stop:float; targets:list[float]; quantity:float; remaining:float; opened_at:str; entry_fee:float; slippage:float; target_index:int=0; realized_pnl:float=0.0
+    symbol: str
+    strategy: str
+    direction: str
+    entry: float
+    stop: float
+    targets: list[float]
+    quantity: float
+    remaining: float
+    opened_at: str
+    entry_fee: float
+    contract_multiplier: float = 1.0
+    target_index: int = 0
+    realized_pnl: float = 0.0
+    gross_pnl: float = 0.0
+    fees: float = 0.0
+    funding_paid: float = 0.0
+    last_funding_at: str | None = None
+    last_mark: float | None = None
+    regime: str = "uncertain_no_trade"
+
 
 class PaperBroker:
-    def __init__(self,path:str="data/vpvr_paper_state.json",initial_balance:float=1000,fee_rate:float=.0005,slippage_bps:float=2): self.path=Path(path); self.initial_balance=initial_balance; self.fee_rate=fee_rate; self.slippage_bps=slippage_bps; self.state=self._load()
+    def __init__(self, path="data/vpvr_paper_state.json", initial_balance=1000.0,
+                 fee_rate=0.0005, slippage_bps=2.0, max_chase_bps=10.0):
+        if initial_balance <= 0 or fee_rate < 0 or slippage_bps < 0 or max_chase_bps < 0:
+            raise ValueError("invalid paper broker configuration")
+        self.path = Path(path)
+        self.fee_rate = float(fee_rate)
+        self.slippage_bps = float(slippage_bps)
+        self.max_chase_bps = float(max_chase_bps)
+        self.initial_balance = float(initial_balance)
+        self.state = self._load()
+
     def _load(self):
         if self.path.exists():
-            try: return json.loads(self.path.read_text())
-            except (OSError,json.JSONDecodeError): raise RuntimeError("paper state file is corrupt; refusing to reset account")
-        return {"balance":self.initial_balance,"positions":{},"trades":[],"mode":"PAPER_ONLY"}
+            try:
+                state = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("paper state is unreadable; refusing to reset virtual account") from exc
+            if state.get("mode") != "PAPER_ONLY":
+                raise RuntimeError("paper state mode invalid; refusing to continue")
+            state.setdefault("pending", {})
+            state.setdefault("positions", {})
+            state.setdefault("trades", [])
+            state.setdefault("balance", self.initial_balance)
+            state.setdefault("last_processed", {})
+            state.setdefault("events", [])
+            return state
+        return {"mode": "PAPER_ONLY", "balance": self.initial_balance, "pending": {},
+                "positions": {}, "trades": [], "last_processed": {}, "events": []}
+
     def _save(self):
-        self.path.parent.mkdir(parents=True,exist_ok=True); fd,tmp=tempfile.mkstemp(dir=self.path.parent,prefix="vpvr-")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix="vpvr-state-")
         try:
-            with os.fdopen(fd,"w") as f: json.dump(self.state,f,indent=2)
-            os.replace(tmp,self.path)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self.state, handle, indent=2, default=str)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
         finally:
-            if os.path.exists(tmp): os.unlink(tmp)
-    def open_position(self,signal,quantity:float)->dict:
-        symbol=signal.symbol
-        if symbol in self.state["positions"]: raise ValueError("paper position already exists for symbol")
-        slip=self.slippage_bps/10000; fill=signal.entry*(1+slip if signal.direction=="LONG" else 1-slip); fee=abs(fill*quantity)*self.fee_rate
-        pos=PaperPosition(symbol,signal.strategy,signal.direction,fill,signal.stop_loss,list(signal.targets),quantity,quantity,signal.timestamp,fee,slip)
-        self.state["balance"]-=fee; self.state["positions"][symbol]=asdict(pos); self._save(); return self.state["positions"][symbol]
-    def mark(self,symbol:str,candle:dict)->dict|None:
-        pos=self.state["positions"].get(symbol)
-        if not pos:return None
-        high=float(candle["high"]); low=float(candle["low"]); close=float(candle["close"]); direction=pos["direction"]
-        stop_hit=low<=pos["stop"] if direction=="LONG" else high>=pos["stop"]
-        if stop_hit:
-            fill=pos["stop"]*(1-self.slippage_bps/10000 if direction=="LONG" else 1+self.slippage_bps/10000)
-            pnl=(fill-pos["entry"])*pos["remaining"] if direction=="LONG" else (pos["entry"]-fill)*pos["remaining"]
-            fee=abs(fill*pos["remaining"])*self.fee_rate; pnl-=fee; self._close(symbol,fill,pnl,"STOP",fee); return {"closed":True,"reason":"STOP","pnl":pnl}
-        while pos["target_index"]<len(pos["targets"]):
-            target=float(pos["targets"][pos["target_index"]]); hit=high>=target if direction=="LONG" else low<=target
-            if not hit: break
-            fraction=.30 if pos["target_index"]==0 else (.45 if pos["target_index"]==1 else 1.0)
-            qty=min(pos["remaining"],pos["quantity"]*fraction); pnl=(target-pos["entry"])*qty if direction=="LONG" else (pos["entry"]-target)*qty
-            fee=abs(target*qty)*self.fee_rate; pnl-=fee; pos["remaining"]-=qty; pos["realized_pnl"]+=pnl; pos["target_index"]+=1; self.state["balance"]+=pnl
-            if pos["target_index"]==1: pos["stop"]=pos["entry"]
-            if pos["remaining"]<=1e-12: self.state["trades"].append({**pos,"exit_reason":"TARGETS","exit_price":target,"net_pnl":pos["realized_pnl"]}); self.state["positions"].pop(symbol,None); self._save(); return {"closed":True,"reason":"TARGETS","pnl":pos["realized_pnl"]}
-        self._save(); return {"closed":False,"mark":close,"unrealized_pnl":(close-pos["entry"])*pos["remaining"] if direction=="LONG" else (pos["entry"]-close)*pos["remaining"]}
-    def _close(self,symbol,price,pnl,reason,fee):
-        pos=self.state["positions"].pop(symbol); total=pos["realized_pnl"]+pnl; self.state["balance"]+=pnl; self.state["trades"].append({**pos,"exit_price":price,"exit_reason":reason,"exit_fee":fee,"net_pnl":total}); self._save()
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    @property
+    def balance(self):
+        return float(self.state["balance"])
+
+    def equity(self, marks=None):
+        value = self.balance
+        for symbol, position in self.state["positions"].items():
+            mark = float((marks or {}).get(symbol, position.get("last_mark") or position["entry"]))
+            qty = float(position["remaining"])
+            mult = float(position.get("contract_multiplier", 1.0))
+            value += ((mark - position["entry"]) if position["direction"] == "LONG"
+                      else (position["entry"] - mark)) * qty * mult
+        return value
+
+    def queue_signal(self, signal, quantity, contract_multiplier=1.0, regime="uncertain_no_trade"):
+        key = f"{signal.symbol}:{signal.strategy}:{signal.timestamp}"
+        if signal.symbol in self.state["positions"]:
+            return False, "position already open"
+        if any(item["symbol"] == signal.symbol for item in self.state["pending"].values()):
+            return False, "pending trigger already exists for symbol"
+        if key in self.state["pending"]:
+            return False, "signal already queued"
+        if quantity <= 0 or contract_multiplier <= 0:
+            return False, "invalid paper quantity"
+        self.state["pending"][key] = {
+            "key": key, "symbol": signal.symbol, "strategy": signal.strategy,
+            "direction": signal.direction, "entry": float(signal.entry),
+            "stop": float(signal.stop_loss), "targets": list(signal.targets[:3]),
+            "quantity": float(quantity), "contract_multiplier": float(contract_multiplier),
+            "created_at": pd.Timestamp(signal.timestamp).isoformat(),
+            "bars_waited": 0, "expiry_candles": int(signal.expiry_candles),
+            "regime": regime
+        }
+        self.state["events"].append({"event": "signal_queued", "key": key})
+        self._save()
+        return True, "trigger queued"
+
+    def process_candle(self, symbol, candle, funding_rate=None):
+        """Process one unique completed 1m candle for a symbol."""
+        timestamp = pd.Timestamp(candle["time"])
+        last = self.state["last_processed"].get(symbol)
+        if last is not None and timestamp <= pd.Timestamp(last):
+            return []
+        high, low = float(candle["high"]), float(candle["low"])
+        open_price, close = float(candle["open"]), float(candle["close"])
+        if not (0 < low <= high and open_price > 0 and close > 0):
+            raise ValueError("invalid paper candle")
+        events = []
+        self.state["last_processed"][symbol] = timestamp.isoformat()
+
+        position = self.state["positions"].get(symbol)
+        if position:
+            position["last_mark"] = close
+            self._apply_funding(position, timestamp, funding_rate, events)
+            direction = position["direction"]
+            stop_hit = low <= position["stop"] if direction == "LONG" else high >= position["stop"]
+            if stop_hit:
+                fill = position["stop"] * (1 - self.slippage_bps / 10000 if direction == "LONG"
+                                           else 1 + self.slippage_bps / 10000)
+                self._close(symbol, fill, "STOP", timestamp, events)
+                self._save()
+                return events
+            targets = position["targets"]
+            fractions = [1.0] if len(targets) == 1 else ([0.30, 0.70] if len(targets) == 2 else [0.30, 0.45, 0.25])
+            while position["target_index"] < len(targets):
+                index = position["target_index"]
+                target = float(targets[index])
+                hit = high >= target if direction == "LONG" else low <= target
+                if not hit:
+                    break
+                qty = min(position["remaining"], position["quantity"] * fractions[min(index, len(fractions) - 1)])
+                gross = ((target - position["entry"]) if direction == "LONG"
+                         else (position["entry"] - target)) * qty * position["contract_multiplier"]
+                fee = abs(target * qty * position["contract_multiplier"]) * self.fee_rate
+                net = gross - fee
+                position["gross_pnl"] += gross
+                position["fees"] += fee
+                position["realized_pnl"] += net
+                position["remaining"] -= qty
+                self.state["balance"] += net
+                position["target_index"] += 1
+                if index == 0:
+                    position["stop"] = position["entry"]
+                elif index == 1 and len(targets) >= 3:
+                    position["stop"] = float(targets[0])
+                events.append({"symbol": symbol, "event": "partial_target", "target": target,
+                               "quantity": qty, "net_pnl": net})
+            if position["remaining"] <= 1e-10:
+                self._finish(symbol, timestamp, float(targets[-1]), "TARGETS")
+                events.append({"symbol": symbol, "event": "closed", "reason": "TARGETS"})
+            self._save()
+            return events
+
+        # Pending entry trigger: not eligible until a later bar than signal timestamp.
+        for key, pending in list(self.state["pending"].items()):
+            if pending["symbol"] != symbol or timestamp <= pd.Timestamp(pending["created_at"]):
+                continue
+            pending["bars_waited"] += 1
+            direction = pending["direction"]
+            entry, stop = float(pending["entry"]), float(pending["stop"])
+            if pending["bars_waited"] > pending["expiry_candles"]:
+                self.state["pending"].pop(key)
+                events.append({"symbol": symbol, "event": "pending_expired"})
+                continue
+            stop_invalidated = low <= stop if direction == "LONG" else high >= stop
+            chase = (open_price > entry * (1 + self.max_chase_bps / 10000) if direction == "LONG"
+                     else open_price < entry * (1 - self.max_chase_bps / 10000))
+            triggered = high >= entry if direction == "LONG" else low <= entry
+            if stop_invalidated or chase:
+                self.state["pending"].pop(key)
+                reason = "stop invalidation before entry" if stop_invalidated else "gap exceeded chase limit"
+                events.append({"symbol": symbol, "event": "pending_cancelled", "reason": reason})
+                continue
+            if not triggered:
+                continue
+            reference = max(entry, open_price) if direction == "LONG" else min(entry, open_price)
+            fill = reference * (1 + self.slippage_bps / 10000 if direction == "LONG"
+                                else 1 - self.slippage_bps / 10000)
+            qty, mult = float(pending["quantity"]), float(pending["contract_multiplier"])
+            fee = abs(fill * qty * mult) * self.fee_rate
+            pos = PaperPosition(
+                symbol=symbol, strategy=pending["strategy"], direction=direction, entry=fill,
+                stop=stop, targets=list(pending["targets"]), quantity=qty, remaining=qty,
+                opened_at=timestamp.isoformat(), entry_fee=fee, contract_multiplier=mult,
+                fees=fee, realized_pnl=-fee, last_funding_at=timestamp.isoformat(),
+                last_mark=fill, regime=pending["regime"]
+            )
+            self.state["balance"] -= fee
+            self.state["positions"][symbol] = asdict(pos)
+            self.state["pending"].pop(key)
+            events.append({"symbol": symbol, "event": "entry_filled", "price": fill,
+                           "quantity": qty, "entry_fee": fee})
+        self._save()
+        return events
+
+    def _apply_funding(self, position, timestamp, funding_rate, events):
+        if funding_rate is None or position.get("last_funding_at") is None:
+            return
+        previous = pd.Timestamp(position["last_funding_at"])
+        periods = int((timestamp - previous).total_seconds() // 28800)
+        if periods <= 0:
+            return
+        rate = float(funding_rate)
+        notional = position["remaining"] * position["entry"] * position["contract_multiplier"]
+        # Positive funding: longs pay shorts receive.
+        cash_flow = -notional * rate * periods if position["direction"] == "LONG" else notional * rate * periods
+        position["funding_paid"] += -cash_flow
+        position["realized_pnl"] += cash_flow
+        self.state["balance"] += cash_flow
+        position["last_funding_at"] = (previous + pd.Timedelta(seconds=28800 * periods)).isoformat()
+        events.append({"symbol": position["symbol"], "event": "funding", "cash_flow": cash_flow})
+
+    def _close(self, symbol, price, reason, timestamp, events):
+        position = self.state["positions"][symbol]
+        qty = float(position["remaining"])
+        gross = ((price - position["entry"]) if position["direction"] == "LONG"
+                 else (position["entry"] - price)) * qty * position["contract_multiplier"]
+        fee = abs(price * qty * position["contract_multiplier"]) * self.fee_rate
+        net = gross - fee
+        position["gross_pnl"] += gross
+        position["fees"] += fee
+        position["realized_pnl"] += net
+        self.state["balance"] += net
+        self._finish(symbol, timestamp, price, reason)
+        events.append({"symbol": symbol, "event": "closed", "reason": reason,
+                       "net_pnl": self.state["trades"][-1]["net_pnl"]})
+
+    def _finish(self, symbol, timestamp, price, reason):
+        position = self.state["positions"].pop(symbol)
+        self.state["trades"].append({**position, "closed_at": pd.Timestamp(timestamp).isoformat(),
+                                     "exit_price": price, "exit_reason": reason,
+                                     "net_pnl": position["realized_pnl"]})
+        self.state["events"].append({"event": "position_closed", "symbol": symbol, "reason": reason})
+        self._save()
+
+    def cancel_all_pending(self, reason="operator_cancel"):
+        count = len(self.state["pending"])
+        self.state["pending"] = {}
+        self.state["events"].append({"event": "pending_cancel_all", "reason": reason, "count": count})
+        self._save()
+        return count
