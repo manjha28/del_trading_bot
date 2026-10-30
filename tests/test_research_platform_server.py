@@ -71,6 +71,10 @@ class ResearchPlatformServerTests(unittest.TestCase):
 
         _, capabilities = self.get("/api/capabilities")
         self.assertIn("open_interest_history", capabilities["not_implemented"])
+        self.assertIn(
+            "mhr_scalp_fast_slow_normalized_exit_adapters",
+            capabilities["available_research_tools"],
+        )
 
         with ResearchDataStore(self.db_path, read_only=True) as store:
             self.assertEqual(store.coverage_summary()["candle_count"], 1)

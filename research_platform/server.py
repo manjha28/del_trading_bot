@@ -100,21 +100,28 @@ def create_handler(db_path: str | Path):
                             ],
                             "not_implemented": [
                                 "orderbook_deltas", "open_interest_history",
-                                    "liquidation_history", "normalized_strategy_exits",
-                                    "portfolio_simulator", "walk_forward_metrics",
-                                    "selection_bias_adjustment", "confidence_intervals",
-                                ],
-                                "available_research_tools": [
-                                    "single_trade_ohlcv_paper_simulator",
-                                    "chronological_train_validation_oos_split",
-                                    "experiment_registry",
-                                ],
-                                "paper_simulator_limitations": [
-                                    "single trade at a time",
-                                    "no partial fills, market impact, funding cash flows, or portfolio netting",
-                                    "unverified contract specifications rejected",
-                                    "OHLCV ambiguity resolved stop-first",
-                                ],
+                                "liquidation_history", "unified_cross_strategy_exit_engine",
+                                "live_strategy_exit_integration", "portfolio_simulator",
+                                "walk_forward_metrics", "selection_bias_adjustment",
+                                "confidence_intervals",
+                            ],
+                            "available_research_tools": [
+                                "single_trade_ohlcv_paper_simulator",
+                                "chronological_train_validation_oos_split",
+                                "experiment_registry",
+                                "mhr_scalp_fast_slow_normalized_exit_adapters",
+                                "vpvr_normalized_exit_plan_delegating_to_paper_engine",
+                            ],
+                            "exit_adapter_limitations": [
+                                "legacy exit simulations do not apply fees or execution costs",
+                                "VPVR exits are still processed by its native paper engine",
+                            ],
+                            "paper_simulator_limitations": [
+                                "single trade at a time",
+                                "no partial fills, market impact, funding cash flows, or portfolio netting",
+                                "unverified contract specifications rejected",
+                                "OHLCV ambiguity resolved stop-first",
+                            ],
                         }
                     elif path == "/api/experiments":
                         result = store.list_experiments(

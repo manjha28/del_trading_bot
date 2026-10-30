@@ -42,8 +42,14 @@ research package is not connected to the live order loop.
   MHR Exhaustion, Scalp Pullback, Fast/Slow MA, POC Reclaim, Value Area
   Rejection, and LVN Breakout. Signal context excludes candles that have not
   closed as of the decision time. Sizing stays separate; legacy quantity is
-  diagnostic only. This slice does not yet normalize strategy exit callbacks
-  or put any adapter into the existing live loop.
+  diagnostic only.
+- **Strategy exit adapters:** wrappers now normalize outcomes from the existing
+  MHR, Scalp Pullback, and Fast/Slow MA exit simulators without changing their
+  execution rules. MHR's partial and remainder PnL remain separate. The
+  outcomes are labeled gross/pre-cost; they are not reported as net results.
+  VPVR exposes a normalized stop/target/trailing plan but continues to process
+  exits through its native paper engine; there is no shared exit simulator or
+  live-loop integration.
 - **Runnable collection and dashboard:** `python -m research_platform collect`
   reconciles and captures supported public observations; `serve` starts a
   loopback-only read-only dashboard/API. The UI shows the instrument catalog,
@@ -54,13 +60,16 @@ research package is not connected to the live order loop.
   slippage and fees, and conservative ambiguous-bar handling. Chronological
   train/validation/OOS splitting supports an embargo. Descriptive paper-result
   summaries retain rejected candidates and explicitly make no significance or
-  confidence-interval claim.
-- **Verification:** 41 focused research-platform tests and 100 total repository
-  tests pass. Compilation, CLI help, and `git diff --check` also pass. Tests use
-  fixtures and do not make exchange requests.
+  confidence-interval claim. Uncosted legacy exit outcomes are excluded from
+  net-PnL aggregation.
+- **Verification:** 47 research-platform tests and 106 total repository tests
+  pass, covering collector, store, dashboard, entry/exit adapters, simulator,
+  and chronological validation. Compilation, CLI help, and `git diff --check`
+  also pass. Tests use fixtures and do not make exchange requests.
 
-**Remaining before claiming integration:** strategy exits are not normalized;
-none of the new research strategy variants has been implemented; the simulator
+**Remaining before claiming integration:** exits are not uniformly executable
+through a shared contract: VPVR remains owned by its native paper engine, and
+the new research strategy variants have not been implemented. The simulator
 is single-trade and lacks depth/impact, partial fills, funding, margin and
 portfolio risk; walk-forward, purge/embargo methodology beyond chronological
 splits, confidence intervals, and selection-bias checks are absent. The
@@ -221,7 +230,7 @@ from discovery or research coverage.
 | 0. Contract and capability agreement | Foundation implemented | Typed instrument, observation, quality, provider, strategy, and signal contracts; source coverage declared. Risk and experiment contracts remain to be finalized with their consumers. | Contract tests pass; no adapter claims unsupported data. |
 | 1. Registry and provider wrappers | Partial | Canonical product records and adapters over coin research / VPVR clients exist. They are not yet wired into existing scanner or CLI workflows. | All products reconciled; newly listed/inactive products retained; adapter parity for source-specific units and timestamps. |
 | 2. Aligned persistence | Initial slice implemented | Additive schema v2, collector CLI, and coverage queries persist supported observations; current store is separate from historical stores. No production migration or scheduler integration. | Idempotent writes, coverage/gap reporting, provenance, restart recovery, and existing store tests pass. |
-| 3. Strategy adapters | Entry wrappers implemented | Entry adapters wrap the six existing strategies; shared exit callbacks and full parity validation remain. | Parity fixtures show wrapper outputs match legacy behavior; no changes to MHR/live behavior; all signals contain timestamp and provenance. |
+| 3. Strategy adapters | Entry wrappers implemented; exit normalization partial | Entry adapters wrap the six existing strategies. MHR, Scalp, and Fast/Slow exit simulators have normalized result wrappers; VPVR has a normalized plan but remains on its native paper engine. No common exit callback contract or live integration exists. | Parity fixtures show wrapper outputs match legacy behavior; no changes to MHR/live behavior; all signals contain timestamp and provenance; remaining VPVR behavior and stateful exits are explicitly covered. |
 | 4. Research variants | Not started | Implement each independent variant only when its required data capability is present. Keep unavailable variants explicitly disabled with reasons. | Per-variant unit tests, no-lookahead tests, and source-validity checks; absorption/order-flow variants require valid trade/book history. |
 | 5. Common simulator | Partial | A single-trade OHLCV paper simulator models verified product rules, fees, spread, slippage, stop gaps, and conservative intrabar ambiguity. It has no depth/impact, latency, partial fills, funding, margin, or portfolio netting. | Add deterministic fixtures for depth/impact, funding, and portfolio exposure. Simulator remains isolated from live client. |
 | 6. Validation / experiments | Partial | Schema-v2 experiment registry, chronological splits with embargo, and descriptive result summaries exist. Walk-forward, purge methodology, uncertainty, and selection-bias checks do not. | Reproducible OOS reports include every discovered product and distinguish no-data/no-event/no-trade from losses. |

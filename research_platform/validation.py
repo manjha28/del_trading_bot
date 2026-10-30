@@ -96,11 +96,19 @@ def summarize_paper_results(results: Iterable[object]) -> dict:
         row for row in rows
         if _field(row, "status") == "simulated"
     ]
+    costed = [
+        row for row in simulated
+        if _field(row, "net_pnl") is not None
+    ]
+    uncosted = [
+        row for row in simulated
+        if _field(row, "net_pnl") is None
+    ]
     rejected_reasons = Counter(
         str(_field(row, "reason")) for row in rows
         if _field(row, "status") != "simulated"
     )
-    pnl = [float(_field(row, "net_pnl")) for row in simulated]
+    pnl = [float(_field(row, "net_pnl")) for row in costed]
     if any(not math.isfinite(value) for value in pnl):
         raise ValueError("paper results contain non-finite PnL")
     wins = [value for value in pnl if value > 0]
@@ -115,9 +123,11 @@ def summarize_paper_results(results: Iterable[object]) -> dict:
     return {
         "candidate_count": len(rows),
         "simulated_count": len(simulated),
+        "costed_simulated_count": len(costed),
+        "uncosted_exit_count": len(uncosted),
         "rejected_count": len(rows) - len(simulated),
         "rejection_reasons": dict(rejected_reasons),
-        "net_pnl_total": sum(pnl),
+        "net_pnl_total": sum(pnl) if pnl else None,
         "net_expectancy_per_simulated_trade": sum(pnl) / len(pnl) if pnl else None,
         "win_rate_pct": len(wins) / len(pnl) * 100 if pnl else None,
         "profit_factor": sum(wins) / abs(sum(losses)) if losses else None,
@@ -126,7 +136,8 @@ def summarize_paper_results(results: Iterable[object]) -> dict:
         "drawdown_basis": "chronologically ordered PnL sequence; not portfolio drawdown",
         "confidence_interval": None,
         "significance_warning": (
-            "Descriptive in-sample/paper metrics only; no confidence interval, "
+            "Descriptive in-sample/paper metrics only; uncosted exit-only outcomes "
+            "are excluded from net PnL metrics. No confidence interval, "
             "walk-forward correction, portfolio drawdown, or selection-bias "
             "adjustment is computed."
         ),

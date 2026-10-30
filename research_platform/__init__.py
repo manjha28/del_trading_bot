@@ -31,6 +31,16 @@ from .strategies import (
 )
 from .simulation import PaperSimulationConfig, PaperSimulator, PaperTradeResult
 from .validation import ChronologicalPeriods, chronological_split, summarize_paper_results
+from .exit_adapters import (
+    ExitSimulationContext,
+    FastSlowMAExitAdapter,
+    MHRExitAdapter,
+    NormalizedExitOutcome,
+    ScalpPullbackExitAdapter,
+    StrategyExitAdapter,
+    VPVRExitPlan,
+    vpvr_exit_plan,
+)
 
 __all__ = [
     "BookLevel",
@@ -40,11 +50,15 @@ __all__ = [
     "DataQuality",
     "DeltaResearchAdapter",
     "FundingObservation",
+    "ExitSimulationContext",
+    "FastSlowMAExitAdapter",
     "FastSlowMAAdapter",
     "Instrument",
     "MHRExhaustionAdapter",
+    "MHRExitAdapter",
     "MarketDataProvider",
     "OrderBookSnapshot",
+    "NormalizedExitOutcome",
     "PaperSimulationConfig",
     "PaperSimulator",
     "PaperTradeResult",
@@ -52,7 +66,9 @@ __all__ = [
     "ResearchCollector",
     "ResearchDataStore",
     "ScalpPullbackAdapter",
+    "ScalpPullbackExitAdapter",
     "StrategyAdapter",
+    "StrategyExitAdapter",
     "StrategyContext",
     "StrategySignal",
     "StrategySpecification",
@@ -61,7 +77,9 @@ __all__ = [
     "TradePrint",
     "UnsupportedCapabilityError",
     "VPVRDataAdapter",
+    "VPVRExitPlan",
     "VPVRStrategyAdapter",
     "chronological_split",
     "summarize_paper_results",
+    "vpvr_exit_plan",
 ]
