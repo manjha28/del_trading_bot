@@ -56,7 +56,7 @@ def _restore_risk(engine, broker, today):
     key=today.isoformat()
     if state.get("risk_day")!=key:
         state["risk_day"]=key
-        state["risk_day_start_equity"]=broker.balance
+        state["risk_day_start_equity"]=broker.equity()
         broker._save()
     engine.reset_day(float(state["risk_day_start_equity"]),today)
     closed=sorted(state.get("trades",[]),key=lambda row:row.get("closed_at",""))
@@ -66,7 +66,7 @@ def _restore_risk(engine, broker, today):
                                    if str(row.get("closed_at","")).startswith(key))
 
 
-def _process_new_paper_bars(broker, symbol, candles, funding_rate):
+def _process_new_paper_bars(broker, symbol, candles):
     last=broker.state.get("last_processed",{}).get(symbol)
     if last is None:
         new_rows=candles.tail(1)
@@ -76,7 +76,9 @@ def _process_new_paper_bars(broker, symbol, candles, funding_rate):
     for row in new_rows.itertuples(index=False):
         candle={"time":row.time,"open":row.open,"high":row.high,"low":row.low,
                 "close":row.close,"volume":row.volume}
-        events.extend(broker.process_candle(symbol,candle,funding_rate=funding_rate))
+        # Funding is charged only when an explicit timestamped settlement event
+        # is supplied. A rate quote alone is not a realized funding event.
+        events.extend(broker.process_candle(symbol,candle))
     return events
 
 
@@ -115,12 +117,22 @@ def scan_once(symbols, paper=False, config=None):
 
             # Process fresh, unique completed 1m bars and reconcile any closes into risk state.
             trade_count_before=len(broker.state["trades"])
-            paper_events=_process_new_paper_bars(broker,symbol,frames["1m"],funding) if paper else []
+            paper_events=_process_new_paper_bars(broker,symbol,frames["1m"]) if paper else []
             if paper:
                 for closed_trade in broker.state["trades"][trade_count_before:]:
                     risk.record_close(float(closed_trade.get("net_pnl",0.0)))
-            mark=ticker.get("mark_price")
-            marks={symbol:float(mark) if mark is not None else float(frames["1m"].close.iloc[-1])}
+            # Mark every open paper position, not just the symbol currently scanned.
+            # Missing tickers retain the last confirmed mark; they never default to zero.
+            marks={}
+            for open_symbol, position in broker.state["positions"].items():
+                open_ticker=tickers.get(open_symbol,{})
+                open_mark=open_ticker.get("mark_price") or open_ticker.get("close")
+                try:
+                    marks[open_symbol]=float(open_mark) if open_mark is not None else float(position.get("last_mark") or position["entry"])
+                except (TypeError,ValueError):
+                    marks[open_symbol]=float(position.get("last_mark") or position["entry"])
+            current_mark=ticker.get("mark_price") or frames["1m"].close.iloc[-1]
+            marks[symbol]=float(current_mark)
             equity=broker.equity(marks)
             risk.update_equity(equity,today)
 
@@ -186,7 +198,8 @@ def scan_once(symbols, paper=False, config=None):
 
             output.append({"symbol":symbol,"status":"ok",
                 "regime":{"name":regime.regime.value,"confidence":regime.confidence,"reasons":regime.reasons},
-                "profile":profile.as_dict(),"spread_pct":spread,"funding_rate":funding,
+                "profile":profile.as_dict(),"spread_pct":spread,"funding_rate_quote":funding,
+                "funding_model_status":"rate quote only; no timestamped settlement event supplied, so no funding cash flow was fabricated",
                 "cvd":cvd,"delta_divergence":divergence,
                 "trade_tape_covers_profile_window":tape_covers_window,
                 "contract_specs":specs,"paper_events":paper_events,"signals":signal_rows})
