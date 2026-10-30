@@ -2,8 +2,9 @@
 
 ## Scope and conclusion
 
-This is a Phase 1 audit and design document only. This audit makes no strategy,
-market-data, backtest, paper-trading, or live-order behavior changes. The
+This document began as a Phase 1 audit and integration design. The progress
+section below records the first additive implementation slices. No existing
+strategy, backtest, paper-trading, or live-order behavior has been changed. The
 existing `coin_research` scanner and VPVR paper-only boundary remain intact.
 
 The repository contains useful independent building blocks, but not a unified
@@ -12,6 +13,48 @@ incompatible market-data and signal schemas, siloed persistence, independent
 risk/execution models, and incomplete cross-strategy research validation.
 Integrate through adapters and explicit shared contracts; do not replace
 working strategy implementations as a first step.
+
+## Implementation progress — 2026-10-30
+
+The following foundation is now implemented in the new `research_platform/`
+package. These are additive components; existing scanners, strategy dispatch,
+CLI behavior, and live execution paths do not call them yet.
+
+- **Canonical contracts and capability-aware provider adapters:** typed
+  instruments with separately verified contract specifications, candles,
+  trades, tickers, order-book snapshots, funding observations, and data-quality
+  records; adapters wrap `coin_research` and
+  VPVR public REST clients. Exchange/source timestamps, aggressor side, and
+  product metadata are retained. Candle timeframes and product-state coverage
+  are declared per provider. Unsupported historical OI, liquidations, and
+  order-book deltas remain unavailable.
+- **Canonical SQLite store v1:** stores product snapshots, candles, ticker
+  snapshots, trade prints, L2 snapshots, funding, and quality records in a
+  separate database. It is not a migration of the coin-research store, VPVR
+  state, or historical reports. Inactive product metadata is retained;
+  “not returned” is assigned only for an explicitly complete catalog snapshot.
+- **Collector service:** reconciles the provider catalog and writes observations
+  through the canonical store. It batch-fetches tickers and does not request
+  live book/trade observations for non-live instruments. Unsupported fields
+  and empty results are recorded as unavailable rather than fabricated.
+- **Strategy entry adapters:** normalized signal records and adapters now wrap
+  MHR Exhaustion, Scalp Pullback, Fast/Slow MA, POC Reclaim, Value Area
+  Rejection, and LVN Breakout. Signal context excludes candles that have not
+  closed as of the decision time. Sizing stays separate; legacy quantity is
+  diagnostic only. This slice does not yet normalize strategy exit callbacks
+  or put any adapter into the existing live loop.
+- **Verification:** 83 repository tests pass, including the 59 pre-existing
+  tests and 24 new tests for canonical contracts, provider boundaries,
+  persistence, collector behavior, and entry adapters. Compilation and
+  `git diff --check` pass. Tests use fixtures and do not make exchange requests.
+
+**Remaining before claiming integration:** no CLI/scheduled runner or existing
+scanner is wired to the collector; no production database has been migrated;
+the shared store has no unified dashboard/API; strategy exits are not yet
+normalized; the new research families, common execution simulator, portfolio
+risk, experiment registry, chronological OOS/walk-forward validation, and
+cross-system end-to-end feed tests remain unimplemented. This is a working
+foundation, not the complete platform.
 
 ## 1. Current dependency and data-flow map
 
@@ -64,6 +107,18 @@ flowchart LR
     Long[long_strategy.py]
     LongBT[local MA signal / exit functions]
     Long --> LongBT
+  end
+
+  subgraph Foundation["Additive shared research foundation — not wired into current flows"]
+    Contracts[research_platform contracts]
+    Adapters[coin_research / VPVR REST adapters]
+    Collector[ResearchCollector]
+    Canonical[(ResearchDataStore v1)]
+    SignalAdapters[normalized strategy entry adapters]
+    Delta --> Adapters --> Contracts --> Collector --> Canonical
+    MHR --> SignalAdapters
+    Long --> SignalAdapters
+    VPStrategies --> SignalAdapters
   end
 ```
 
@@ -146,18 +201,18 @@ separate persisted decisions. Spread, depth, impact, lot-size verification, or
 minimum order constraints may reject execution but must not remove a product
 from discovery or research coverage.
 
-## 4. Staged implementation plan after design review
+## 4. Remaining staged implementation plan
 
-| Stage | Work | Exit criteria / safety gate |
-|---|---|---|
-| 0. Contract and capability agreement | Finalize instrument, observation, quality, provider, strategy, risk, and experiment contracts; document source semantics and capability matrix. | Contract tests pass; no adapter claims unsupported data. |
-| 1. Registry and provider wrappers | Add canonical instrument registry and normalized provider façade around existing adapters. Keep `coin_research`, VPVR, scanner, and legacy request paths working. | All current perpetual products reconciled; newly listed and inactive products retained; adapter parity fixtures cover timestamps, units, and missing fields. |
-| 2. Aligned persistence | Add versioned storage for canonical observations and product history; import or read existing stores without destructive migration. | Idempotent writes, coverage/gap reporting, provenance, restart recovery, and existing store tests pass. |
-| 3. Strategy adapters | Wrap MHR Exhaustion, Scalp Pullback, Fast/Slow MA, POC Reclaim, Value Area Rejection, and LVN Breakout. | Parity fixtures show wrapper outputs match legacy behavior; no changes to MHR/live behavior; all signals contain timestamp and provenance. |
-| 4. Research variants | Implement each independent variant only when its required data capability is present. Keep unavailable variants explicitly disabled with reasons. | Per-variant unit tests, no-lookahead tests, and source-validity checks; absorption/order-flow variants require valid trade/book history. |
-| 5. Common simulator | Add costs and fills incrementally: product rules, bid/ask, fees, slippage/impact, latency/partial fills, funding, ambiguous bars, margin and portfolio limits. | Deterministic fixtures for contract rounding, gap stops, same-bar ambiguity, fees/funding, and portfolio exposure. Simulator remains isolated from live client. |
-| 6. Validation / experiments | Add chronological splits, walk-forward, embargo/purge where justified, dataset/config versioning, coverage-aware pooled and per-symbol metrics, uncertainty and selection-bias checks. | Reproducible OOS reports include every discovered product and distinguish no-data/no-event/no-trade from losses. |
-| 7. Unified read-only dashboard | Build on canonical queries for universe, sleeping/awakening/expansion, strategy comparison, paper outcomes, data/feed quality, and per-symbol explanations. | API/UI integration tests; read-only by construction; existing coin research dashboard remains usable. |
+| Stage | Status | Work | Exit criteria / safety gate |
+|---|---|---|---|
+| 0. Contract and capability agreement | Foundation implemented | Typed instrument, observation, quality, provider, strategy, and signal contracts; source coverage declared. Risk and experiment contracts remain to be finalized with their consumers. | Contract tests pass; no adapter claims unsupported data. |
+| 1. Registry and provider wrappers | Partial | Canonical product records and adapters over coin research / VPVR clients exist. They are not yet wired into existing scanner or CLI workflows. | All products reconciled; newly listed/inactive products retained; adapter parity for source-specific units and timestamps. |
+| 2. Aligned persistence | Initial slice implemented | Additive schema v1 and collector persist supported observations; current store is separate from historical stores. No production migration or scheduler/CLI ingestion path yet. | Idempotent writes, coverage/gap reporting, provenance, restart recovery, and existing store tests pass. |
+| 3. Strategy adapters | Entry wrappers implemented | Entry adapters wrap the six existing strategies; shared exit callbacks and full parity validation remain. | Parity fixtures show wrapper outputs match legacy behavior; no changes to MHR/live behavior; all signals contain timestamp and provenance. |
+| 4. Research variants | Not started | Implement each independent variant only when its required data capability is present. Keep unavailable variants explicitly disabled with reasons. | Per-variant unit tests, no-lookahead tests, and source-validity checks; absorption/order-flow variants require valid trade/book history. |
+| 5. Common simulator | Not started | Add costs and fills incrementally: product rules, bid/ask, fees, slippage/impact, latency/partial fills, funding, ambiguous bars, margin and portfolio limits. | Deterministic fixtures for contract rounding, gap stops, same-bar ambiguity, fees/funding, and portfolio exposure. Simulator remains isolated from live client. |
+| 6. Validation / experiments | Not started | Add chronological splits, walk-forward, embargo/purge where justified, dataset/config versioning, coverage-aware pooled and per-symbol metrics, uncertainty and selection-bias checks. | Reproducible OOS reports include every discovered product and distinguish no-data/no-event/no-trade from losses. |
+| 7. Unified read-only dashboard | Not started | Build on canonical queries for universe, sleeping/awakening/expansion, strategy comparison, paper outcomes, data/feed quality, and per-symbol explanations. | API/UI integration tests; read-only by construction; existing coin research dashboard remains usable. |
 
 At every stage, shadow/paper output only. The first integration PR should not
 change the MHR implementation, `main.py`, existing live order behavior, or
