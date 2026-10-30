@@ -108,12 +108,11 @@ def scan_once(symbols, paper=False, config=None):
                 output.append({"symbol":symbol,"status":"no_trade_spread_unavailable_or_too_wide",
                     "bid":bid,"ask":ask,"spread_pct":spread,"max_spread_pct":cfg.max_spread_pct})
                 continue
-            funding=ticker.get("funding_rate")
-            try: funding=float(funding) if funding is not None else None
-            except (TypeError,ValueError): funding=None
-            if funding is None:
+            try:
+                funding=data.fetch_current_funding_rate(symbol)
+            except MarketDataError as exc:
                 output.append({"symbol":symbol,"status":"no_trade_funding_rate_unavailable",
-                    "reason":"funding-rate filter cannot be evaluated"})
+                    "reason":str(exc)})
                 continue
             if abs(funding)>cfg.max_abs_funding_rate:
                 output.append({"symbol":symbol,"status":"no_trade_funding_rate_exceeded",
