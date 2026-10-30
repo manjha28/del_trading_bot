@@ -55,7 +55,7 @@ class BacktestConfig:
     max_capital_usage_pct: float = 0.50
     leverage: float = 20.0
     sl_capital_pct: float = 0.05
-    pt_capital_pct: float = 1.0
+    pt_capital_pct: float = 0.20
     min_rr: float = 4.0
     max_holding_candles: int = 24
     charge_rate: float = 0.0005
