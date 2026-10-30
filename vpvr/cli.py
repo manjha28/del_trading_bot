@@ -107,27 +107,42 @@ def scan_once(symbols, paper=False, config=None):
             bid,ask,spread=_best_quote(data,ticker,symbol)
             if spread is None or spread>cfg.max_spread_pct:
                 output.append({"symbol":symbol,"status":"no_trade_spread_unavailable_or_too_wide",
-                               "bid":bid,"ask":ask,"spread_pct":spread,"max_spread_pct":cfg.max_spread_pct})
+                    "bid":bid,"ask":ask,"spread_pct":spread,"max_spread_pct":cfg.max_spread_pct})
                 continue
-
             funding=ticker.get("funding_rate")
             try: funding=float(funding) if funding is not None else None
             except (TypeError,ValueError): funding=None
-            # Apply newly closed 1m bars once. On a fresh paper account only the newest
-            # bar is processed to avoid inventing fills before the account was started.
+
+            # Process fresh, unique completed 1m bars and reconcile any closes into risk state.
             trade_count_before=len(broker.state["trades"])
             paper_events=_process_new_paper_bars(broker,symbol,frames["1m"],funding) if paper else []
             if paper:
                 for closed_trade in broker.state["trades"][trade_count_before:]:
                     risk.record_close(float(closed_trade.get("net_pnl",0.0)))
-            marks={symbol:float(ticker.get("mark_price") or frames["1m"].close.iloc[-1])}
+            mark=ticker.get("mark_price")
+            marks={symbol:float(mark) if mark is not None else float(frames["1m"].close.iloc[-1])}
             equity=broker.equity(marks)
             risk.update_equity(equity,today)
 
             profile_frame=frames["15m"].tail(cfg.profile_lookback_15m)
-            profile=build_volume_profile(profile_frame,rows=cfg.profile_rows,
-                value_area_pct=cfg.value_area_pct,smoothing_window=cfg.node_smoothing_window,
-                node_threshold_pct=cfg.node_threshold_pct)
+            profile_start=pd.Timestamp(profile_frame.time.iloc[0])
+            profile_end=pd.Timestamp(profile_frame.time.iloc[-1])+pd.Timedelta(minutes=15)
+            # True trade-level VP is used only when the REST tape covers the entire
+            # requested profile window. Otherwise use a prominently labeled OHLCV estimate.
+            try:
+                trades=data.fetch_public_trades(symbol)
+            except MarketDataError:
+                trades=pd.DataFrame(columns=["time","price","volume","side"])
+            tape_covers_window=(not trades.empty and trades.time.min()<=profile_start and
+                                trades.time.max()>=profile_end-pd.Timedelta(minutes=1))
+            if tape_covers_window:
+                profile=build_volume_profile(trades=trades.loc[(trades.time>=profile_start)&(trades.time<profile_end)],
+                    rows=cfg.profile_rows,value_area_pct=cfg.value_area_pct,
+                    smoothing_window=cfg.node_smoothing_window,node_threshold_pct=cfg.node_threshold_pct)
+            else:
+                profile=build_volume_profile(profile_frame,rows=cfg.profile_rows,
+                    value_area_pct=cfg.value_area_pct,smoothing_window=cfg.node_smoothing_window,
+                    node_threshold_pct=cfg.node_threshold_pct)
             profile_history=rolling_profiles(frames["15m"].tail(96),rows=cfg.profile_rows,
                 value_area_pct=cfg.value_area_pct,window=32,step=16,
                 smoothing_window=cfg.node_smoothing_window,node_threshold_pct=cfg.node_threshold_pct)
@@ -135,24 +150,9 @@ def scan_once(symbols, paper=False, config=None):
             signals=generate_signals(symbol,frames["1m"],frames["3m"],frames["15m"],
                 profile,regime,cfg.min_reward_risk,cfg.min_volume_multiple)
 
-            # Aggressor CVD is available only from the REST public trade side field.
-            try:
-                trades=data.fetch_public_trades(symbol)
-                cvd=cumulative_volume_delta(trades)
-                delta_bars=trade_delta_bars(trades,"1min")
-                divergence=delta_divergence(frames["1m"].tail(10),delta_bars.tail(10),lookback=10)
-                # Use trade-level VP only when the received tape covers the profile window.
-                profile_start=pd.Timestamp(profile_frame.time.iloc[0])
-                profile_end=pd.Timestamp(profile_frame.time.iloc[-1])+pd.Timedelta(minutes=15)
-                tape_covers_window=(not trades.empty and trades.time.min()<=profile_start and trades.time.max()>=profile_end-pd.Timedelta(minutes=1))
-                if tape_covers_window:
-                    profile=build_volume_profile(trades=trades.loc[(trades.time>=profile_start)&(trades.time<profile_end)],
-                        rows=cfg.profile_rows,value_area_pct=cfg.value_area_pct,
-                        smoothing_window=cfg.node_smoothing_window,node_threshold_pct=cfg.node_threshold_pct)
-            except MarketDataError as exc:
-                cvd={"available":False,"value":None,"reason":str(exc)}
-                divergence={"available":False,"bullish":False,"bearish":False,"reason":str(exc)}
-                tape_covers_window=False
+            cvd=cumulative_volume_delta(trades)
+            delta_bars=trade_delta_bars(trades,"1min")
+            divergence=delta_divergence(frames["1m"].tail(10),delta_bars.tail(10),lookback=10)
             specs=data.contract_specs(product)
             if specs is None:
                 output.append({"symbol":symbol,"status":"contract_metadata_incomplete",
@@ -176,25 +176,26 @@ def scan_once(symbols, paper=False, config=None):
                 if paper:
                     queued,reason=broker.queue_signal(signal,decision.quantity,
                         contract_multiplier=specs["contract_multiplier"],regime=regime.regime.value)
-                    signal_rows.append({"signal":signal.as_dict(),"status":"paper_trigger_queued" if queued else "paper_rejected",
-                        "reason":reason,"risk":decision.__dict__,"contract_specs_verified":specs["spec_verified"]})
+                    signal_rows.append({"signal":signal.as_dict(),
+                        "status":"paper_trigger_queued" if queued else "paper_rejected",
+                        "reason":reason,"risk":decision.__dict__,
+                        "contract_specs_verified":specs["spec_verified"]})
                 else:
                     signal_rows.append({"signal":signal.as_dict(),"status":"signal_only",
                         "risk":decision.__dict__,"contract_specs_verified":specs["spec_verified"]})
 
-            output.append({"symbol":symbol,"status":"ok","regime":{"name":regime.regime.value,
-                "confidence":regime.confidence,"reasons":regime.reasons},
-                "profile":profile.as_dict(),"profile_source":profile.source,
-                "spread_pct":spread,"funding_rate":funding,"cvd":cvd,
-                "delta_divergence":divergence,"profile_source":profile.source,
+            output.append({"symbol":symbol,"status":"ok",
+                "regime":{"name":regime.regime.value,"confidence":regime.confidence,"reasons":regime.reasons},
+                "profile":profile.as_dict(),"spread_pct":spread,"funding_rate":funding,
+                "cvd":cvd,"delta_divergence":divergence,
                 "trade_tape_covers_profile_window":tape_covers_window,
                 "contract_specs":specs,"paper_events":paper_events,"signals":signal_rows})
         except (MarketDataError,ValueError,KeyError) as exc:
             output.append({"symbol":symbol,"status":"data_or_signal_error","reason":str(exc)})
     return {"mode":"PAPER_ONLY" if paper else "SIGNAL_ONLY","exchange":"Delta Exchange India",
-            "account_balance":broker.balance,"account_equity":broker.equity(),
-            "open_paper_positions":len(broker.state["positions"]),
-            "pending_paper_entries":len(broker.state["pending"]),"results":output}
+        "account_balance":broker.balance,"account_equity":broker.equity(),
+        "open_paper_positions":len(broker.state["positions"]),
+        "pending_paper_entries":len(broker.state["pending"]),"results":output}
 
 
 def _load_csv(path):
