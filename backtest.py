@@ -1,5 +1,6 @@
 import argparse
 import math
+import os
 import random
 import time
 import logging
@@ -54,7 +55,7 @@ class BacktestConfig:
     max_capital_usage_pct: float = 0.50
     leverage: float = 20.0
     sl_capital_pct: float = 0.05
-    pt_capital_pct: float = 1.0
+    pt_capital_pct: float = 0.20
     min_rr: float = 4.0
     max_holding_candles: int = 24
     charge_rate: float = 0.0005
@@ -68,6 +69,7 @@ class BacktestConfig:
     use_1m_resolution: bool = True
     max_reentries: int = 3
     reentry_cooldown_candles: int = 1
+    entry_paths: tuple = ("MHR_EXHAUSTION", "PUMP_HESITATION", "REENTRY")
     scalp_ema_5m: int = 20
     scalp_ema_1h: int = 50
     scalp_cooldown: int = 3
@@ -225,12 +227,29 @@ def backtest_mhr_symbol(symbol, candles, config, running_equity=None,
                  and idx >= last_sl_idx + config.reentry_cooldown_candles)
         fi = unified_entry_filter(prepared, idx, strat_cfg, is_reentry=is_re, previous_entry_price=last_ep)
         if not fi: f_rej += 1; idx += 1; continue
+        if fi.get("entry_path") not in config.entry_paths: f_rej += 1; idx += 1; continue
         trade_cap = calculate_trade_capital(equity, strat_cfg)
         if trade_cap < config.min_trade_capital: cap_rej += 1; idx += 1; continue
-        try:
-            sl_price, tp_price, qty = calculate_sl_tp_prices(
-                entry_price, strat_cfg, trade_cap, atr_val, fi.get("use_pump_atr", False))
-        except ValueError: sl_rej += 1; idx += 1; continue
+        # Structural SL: place stop at prev candle high (a real market level).
+        # This makes 2R achievable — small risk distance means 2R target is close.
+        # Falls back to ATR when prev_high <= entry_price (gap-up) or qty floors to 0.
+        prev_high = float(prepared.iloc[idx - 1]["high"]) if idx > 0 else entry_price
+        sl_method = "atr"
+        sl_price = tp_price = 0.0; qty = 0
+        if prev_high > entry_price:
+            _max_loss = trade_cap * strat_cfg.sl_capital_pct
+            _raw = math.floor(_max_loss / (prev_high - entry_price))
+            if _raw >= 1:
+                _qty = min(_raw, math.floor(trade_cap * strat_cfg.leverage / entry_price))
+                if _qty >= 1:
+                    sl_price = prev_high; qty = _qty; sl_method = "structural"
+                    _tp = max(trade_cap * strat_cfg.pt_capital_pct, _max_loss * strat_cfg.min_rr)
+                    tp_price = entry_price - _tp / qty
+        if sl_method == "atr":
+            try:
+                sl_price, tp_price, qty = calculate_sl_tp_prices(
+                    entry_price, strat_cfg, trade_cap, atr_val, fi.get("use_pump_atr", False))
+            except ValueError: sl_rej += 1; idx += 1; continue
         part, rest, reason, exit_time, final_sl, bars, q_part = _sim_trailing_exit(
             prepared, idx, entry_price, sl_price, qty, config.max_holding_candles, bulk_1m, config.use_1m_resolution)
         gross = part + rest
@@ -260,7 +279,8 @@ def backtest_mhr_symbol(symbol, candles, config, running_equity=None,
             "pump_pct": fi.get("pump_pct", 0), "volume_surge": fi.get("volume_surge", 0),
             "ema_distance_pct": fi.get("ema_distance_pct"), "rsi14": fi.get("rsi14"),
             "bars_held": bars, "gross_pnl": gross, "fees": fees, "net_pnl": net,
-            "roi_on_capital": net / trade_cap if trade_cap > 0 else 0.0, "exit_reason": reason})
+            "roi_on_capital": net / trade_cap if trade_cap > 0 else 0.0,
+            "exit_reason": reason, "sl_method": sl_method})
         if reason == "SL_OR_TRAIL":
             pw = prepared.iloc[max(0, idx - strat_cfg.lookback_hours):idx + 1]
             if detect_pump(pw, strat_cfg) or fi.get("pump_pct", 0) > 0:
@@ -357,6 +377,72 @@ def load_perf_filter(path):
     return set(keep["symbol"].astype(str)) if not keep.empty else None
 
 
+def _write_insights(all_trades, summary, overall, config, start_ts, end_ts, path):
+    ts_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    date_from = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+    date_to   = datetime.fromtimestamp(end_ts,   tz=timezone.utc).strftime("%Y-%m-%d")
+    n     = len(all_trades)
+    wins  = int((all_trades["net_pnl"] > 0).sum())
+    wr    = wins / n if n > 0 else 0.0
+    gross = float(all_trades["gross_pnl"].sum()) if "gross_pnl" in all_trades.columns else 0.0
+    fees  = float(all_trades["fees"].sum())      if "fees"      in all_trades.columns else 0.0
+    net   = float(all_trades["net_pnl"].sum())
+    pct   = (net / config.initial_capital) * 100
+
+    lines = [
+        f"# Backtest Insights — {ts_label}",
+        "",
+        "## Run Parameters",
+        f"- Period: {date_from} → {date_to}",
+        f"- Capital: ${config.initial_capital:.2f} | Leverage: {config.leverage}x",
+        f"- Entry paths: {', '.join(config.entry_paths)}",
+        f"- ATR mult: {config.atr_sl_multiplier} | Pump ATR mult: {config.pump_atr_sl_multiplier}",
+        f"- Max hold: {config.max_holding_candles}h | Max reentries: {config.max_reentries}",
+        f"- Charges: {config.charge_rate * 100:.3f}%",
+        "",
+        "## Overall Results",
+        f"- Trades: {n} | Wins: {wins} | Win Rate: {wr:.1%}",
+        f"- Gross PnL: ${gross:.2f} | Fees: ${fees:.2f} | Net PnL: ${net:.2f}",
+        f"- Return on capital: {pct:.2f}%",
+    ]
+
+    if not summary.empty and len(summary) > 1:
+        best  = summary.loc[summary["total_net_pnl"].idxmax()]
+        worst = summary.loc[summary["total_net_pnl"].idxmin()]
+        lines += [
+            "",
+            "## Symbol Highlights",
+            f"- Best:  {best['symbol']} — net ${best['total_net_pnl']:.2f}, "
+            f"WR {best['win_rate']:.1%}, {int(best['trades'])} trades",
+            f"- Worst: {worst['symbol']} — net ${worst['total_net_pnl']:.2f}, "
+            f"WR {worst['win_rate']:.1%}, {int(worst['trades'])} trades",
+        ]
+
+    if "entry_path" in all_trades.columns:
+        lines += ["", "## Entry Path Breakdown"]
+        for ep, cnt in all_trades["entry_path"].value_counts().items():
+            ep_sub = all_trades[all_trades["entry_path"] == ep]
+            ep_wr  = (ep_sub["net_pnl"] > 0).mean()
+            ep_net = ep_sub["net_pnl"].sum()
+            lines.append(f"- {ep}: {cnt} trades, WR {ep_wr:.1%}, net ${ep_net:.2f}")
+
+    if "sl_method" in all_trades.columns:
+        lines += ["", "## SL Method Split"]
+        for method, cnt in all_trades["sl_method"].value_counts().items():
+            m_sub = all_trades[all_trades["sl_method"] == method]
+            m_wr  = (m_sub["net_pnl"] > 0).mean()
+            m_net = m_sub["net_pnl"].sum()
+            lines.append(f"- {method}: {cnt} trades, WR {m_wr:.1%}, net ${m_net:.2f}")
+
+    if "exit_reason" in all_trades.columns:
+        lines += ["", "## Exit Reason Distribution"]
+        for reason, cnt in all_trades["exit_reason"].value_counts().items():
+            lines.append(f"- {reason}: {cnt}")
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Unified Backtest: MHR + Pump + Scalp 5m (Dynamic Fees)")
     p.add_argument("--symbols", nargs="*")
@@ -379,6 +465,9 @@ def parse_args():
     p.add_argument("--pump-volume-surge", type=float, default=2.0)
     p.add_argument("--max-reentries", type=int, default=3)
     p.add_argument("--reentry-cooldown", type=int, default=1)
+    p.add_argument("--entry-paths", nargs="*",
+                   default=["MHR_EXHAUSTION", "PUMP_HESITATION", "REENTRY"],
+                   choices=["MHR_EXHAUSTION", "PUMP_HESITATION", "REENTRY"])
     p.add_argument("--no-1m-resolution", action="store_true")
     p.add_argument("--scalp-ema-5m", type=int, default=20)
     p.add_argument("--scalp-ema-1h", type=int, default=50)
@@ -427,6 +516,7 @@ def main():
         min_atr_pct=args.min_atr_pct, min_trade_capital=args.min_trade_capital,
         use_1m_resolution=not args.no_1m_resolution,
         max_reentries=args.max_reentries, reentry_cooldown_candles=args.reentry_cooldown,
+        entry_paths=tuple(args.entry_paths),
         scalp_ema_5m=args.scalp_ema_5m, scalp_ema_1h=args.scalp_ema_1h,
         scalp_cooldown=args.scalp_cooldown,
         scalp_max_session_trades=args.scalp_max_session_trades,
@@ -487,29 +577,30 @@ def main():
                     logger.error(f"  [{done}/{len(filtered)}] {sym}: {e}")
         flat = []
         for t in all_trades_map.values(): flat.extend(t)
-        if flat:
-            flat.sort(key=lambda t: str(t["entry_time"]))
-            equity = config.initial_capital
-            for trade in flat:
-                tc = equity * config.max_capital_usage_pct
-                if tc < config.min_trade_capital: continue
-                oc = trade["trade_capital"]
-                if oc > 0:
-                    scale = tc / oc
-                    trade["trade_capital"] = tc; trade["equity_before_trade"] = equity
-                    trade["net_pnl"] *= scale; trade["gross_pnl"] *= scale; trade["fees"] *= scale
-                    equity += trade["net_pnl"]; trade["equity_after_trade"] = equity
-                    if equity < 0: equity = 0.0
-                trade_rows.append(trade)
+        flat.sort(key=lambda t: str(t["entry_time"]))
+        trade_rows.extend(flat)
+        # Each symbol ran independently at initial_capital — do NOT re-scale PnL by
+        # running equity. The old scaling pass compounded wins across symbols and
+        # produced unrealistic numbers (e.g. $7.5M from $100). Aggregate as-is.
+        equity = config.initial_capital + sum(t["net_pnl"] for t in flat)
 
     all_trades = pd.DataFrame(trade_rows)
     if all_trades.empty: logger.warning("No trades."); return
 
-    all_trades.to_csv(args.output, index=False)
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "strategy-short", "mhr_pump_short", "backtest_results")
+    os.makedirs(out_dir, exist_ok=True)
+    trades_path  = os.path.join(out_dir, f"{ts_str}_backtest_trades.csv")
+    summary_path = os.path.join(out_dir, f"{ts_str}_backtest_summary.csv")
+    overall_path = os.path.join(out_dir, f"{ts_str}_backtest_overall.csv")
+    insights_path = os.path.join(out_dir, f"{ts_str}_insights.md")
+
+    all_trades.to_csv(trades_path, index=False)
     summary = build_summary(all_trades)
     overall = build_overall(all_trades, config.initial_capital)
-    summary.to_csv(args.summary_output, index=False)
-    overall.to_csv(args.overall_output, index=False)
+    summary.to_csv(summary_path, index=False)
+    overall.to_csv(overall_path, index=False)
 
     pct = ((equity - config.initial_capital) / config.initial_capital) * 100
     print(f"\n{'='*70}\nEQUITY CURVE\n{'='*70}")
@@ -519,7 +610,8 @@ def main():
     print(f"\n{'='*70}\nEXIT REASONS\n{'='*70}\n{all_trades['exit_reason'].value_counts().to_string()}")
     if "entry_path" in all_trades.columns:
         print(f"\n{'='*70}\nENTRY PATHS\n{'='*70}\n{all_trades['entry_path'].value_counts().to_string()}")
-    print(f"\nSaved: {args.output}, {args.summary_output}, {args.overall_output}")
+    _write_insights(all_trades, summary, overall, config, start_ts, end_ts, insights_path)
+    print(f"\nSaved:\n  {trades_path}\n  {summary_path}\n  {overall_path}\n  {insights_path}")
 
 
 if __name__ == "__main__":
