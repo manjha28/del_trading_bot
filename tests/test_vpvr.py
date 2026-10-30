@@ -16,6 +16,7 @@ from vpvr.risk import RiskEngine
 from vpvr.strategies import StrategySignal, _make
 from vpvr.paper import PaperBroker
 from vpvr.data import DeltaMarketData
+from vpvr.cli import _current_paper_marks
 from vpvr.stream import DeltaPublicStream
 from vpvr.backtest import BacktestConfig, run_backtest, _completed_1m_history, _quantity
 from vpvr.engine import VPVREngine
@@ -239,6 +240,21 @@ class PaperTests(unittest.TestCase):
 
 
 class DataTests(unittest.TestCase):
+
+    def test_paper_equity_marks_use_current_ticker_and_last_confirmed_fallback(self):
+        positions = {
+            "BTCUSD": {"entry": 79000.0, "last_mark": 80000.0},
+            "ETHUSD": {"entry": 2900.0, "last_mark": 3000.0},
+            "SOLUSD": {"entry": 100.0, "last_mark": 101.0},
+        }
+        tickers = {
+            "BTCUSD": {"mark_price": "81000"},
+            "ETHUSD": {"mark_price": None, "close": "3050"},
+            "SOLUSD": {},
+        }
+        marks = _current_paper_marks(positions, tickers)
+        self.assertEqual(marks, {"BTCUSD": 81000.0, "ETHUSD": 3050.0, "SOLUSD": 101.0})
+
     def test_public_trade_loader_preserves_identical_distinct_execution_rows(self):
         data=DeltaMarketData(config=VPVRConfig())
         duplicate={"price":100.0,"size":2.0,"side":"buy","timestamp":1767225600000000}
