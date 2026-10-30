@@ -25,6 +25,7 @@ class VPVRConfig:
     node_threshold_pct: float = 0.15
     max_data_age_seconds: int = 90
     max_spread_pct: float = 0.20
+    max_abs_funding_rate: float = 0.001
     initial_paper_balance: float = 1000.0
     fee_rate: float = 0.0005
     slippage_bps: float = 2.0
@@ -52,6 +53,7 @@ class VPVRConfig:
             node_threshold_pct=float(os.getenv("VPVR_NODE_THRESHOLD_PCT", "0.15")),
             max_data_age_seconds=int(os.getenv("VPVR_MAX_DATA_AGE_SECONDS", "90")),
             max_spread_pct=float(os.getenv("VPVR_MAX_SPREAD_PCT", "0.20")),
+            max_abs_funding_rate=float(os.getenv("VPVR_MAX_ABS_FUNDING_RATE", "0.001")),
             initial_paper_balance=float(os.getenv("VPVR_PAPER_BALANCE", "1000")),
             fee_rate=float(os.getenv("VPVR_FEE_RATE", "0.0005")),
             slippage_bps=float(os.getenv("VPVR_SLIPPAGE_BPS", "2")),
@@ -80,8 +82,8 @@ class VPVRConfig:
             raise ValueError("invalid volume-node configuration")
         if self.max_data_age_seconds < 1 or self.profile_lookback_15m < 30 or self.max_hold_minutes < 1:
             raise ValueError("invalid freshness/profile lookback")
-        if self.max_spread_pct <= 0:
-            raise ValueError("max spread must be positive")
+        if self.max_spread_pct <= 0 or self.max_abs_funding_rate < 0:
+            raise ValueError("invalid spread or funding filter")
         if self.initial_paper_balance <= 0 or self.fee_rate < 0 or self.slippage_bps < 0:
             raise ValueError("invalid paper account or cost configuration")
         if not self.paper_state_file:
