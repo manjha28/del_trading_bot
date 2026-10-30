@@ -97,6 +97,45 @@ class ResearchDataStoreTests(unittest.TestCase):
         self.assertEqual(summary["funding_observation_count"], 1)
         self.assertEqual(summary["data_quality_observations"], {"trades": 1})
 
+    def test_market_event_capture_is_durable_and_migration_is_additive(self):
+        timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+        event = {
+            "type": "trades",
+            "symbol": "TESTUSD",
+            "price": 10.5,
+            "aggressor_side": None,
+        }
+        self.store.save_market_event(
+            "1001", "TESTUSD", "trades", timestamp, event,
+            exchange_time=timestamp, source_event_id="trade-1",
+        )
+        self.store.save_market_event(
+            "1001", "TESTUSD", "trades", timestamp, event,
+            exchange_time=timestamp, source_event_id="trade-1",
+        )
+        self.store.record_stream_health(
+            "delta-public-000", timestamp, "connected", True, 1, 2,
+            ["TESTUSD"], last_event_at=timestamp,
+        )
+        self.assertEqual(self.store.coverage_summary()["market_event_count"], 1)
+        self.assertEqual(
+            self.store.list_market_events(event_type="trades")["items"][0]["payload"],
+            event,
+        )
+        health = self.store.list_stream_health()["items"][0]
+        self.assertEqual(health["dropped_events"], 2)
+        self.assertEqual(health["symbols"], ["TESTUSD"])
+
+        self.store.connection.executescript("""
+            DROP TABLE market_events;
+            DROP TABLE stream_health;
+            PRAGMA user_version = 3;
+        """)
+        self.store.close()
+        self.store = ResearchDataStore(self.directory.name + "/research.sqlite3")
+        self.assertEqual(self.store.coverage_summary()["schema_version"], 4)
+        self.assertEqual(self.store.coverage_summary()["market_event_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

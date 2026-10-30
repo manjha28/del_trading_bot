@@ -18,7 +18,7 @@ from .market_data import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _json(value: object) -> str:
@@ -204,6 +204,39 @@ class ResearchDataStore:
             );
             CREATE INDEX IF NOT EXISTS variant_evaluations_time_idx
                 ON variant_evaluations(evaluated_at DESC,id DESC);
+            CREATE TABLE IF NOT EXISTS market_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id TEXT NOT NULL REFERENCES instruments(product_id),
+                symbol TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                exchange_time TEXT,
+                source_event_id TEXT,
+                sequence INTEGER,
+                integrity TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS market_events_time_idx
+                ON market_events(received_at DESC,id DESC);
+            CREATE INDEX IF NOT EXISTS market_events_product_idx
+                ON market_events(product_id,event_type,received_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS market_events_source_id_idx
+                ON market_events(product_id,event_type,source_event_id)
+                WHERE source_event_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS stream_health (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stream_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                state TEXT NOT NULL,
+                connected INTEGER NOT NULL,
+                reconnects INTEGER NOT NULL,
+                dropped_events INTEGER NOT NULL,
+                last_event_at TEXT,
+                last_error TEXT,
+                symbols_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS stream_health_latest_idx
+                ON stream_health(stream_id,observed_at DESC,id DESC);
         """)
         if version < SCHEMA_VERSION:
             self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -292,6 +325,121 @@ class ResearchDataStore:
             "instrument_states": counts,
             "latest_quality_coverage": data_counts,
             "latest_ticker_time": latest_capture,
+            "latest_stream_health": self.list_stream_health(limit=100),
+        }
+
+    def save_market_event(
+        self,
+        product_id: str,
+        symbol: str,
+        event_type: str,
+        received_at: datetime,
+        payload: dict,
+        *,
+        exchange_time: datetime | None = None,
+        source_event_id: str | None = None,
+        sequence: int | None = None,
+        integrity: str = "not_provided",
+    ) -> None:
+        if not all(value.strip() for value in (str(product_id), symbol, event_type)):
+            raise ValueError("market event product, symbol, and type are required")
+        if sequence is not None and sequence < 0:
+            raise ValueError("market event sequence cannot be negative")
+        if integrity not in ("not_provided", "synchronized", "gap_detected"):
+            raise ValueError("invalid market event integrity")
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO market_events
+                (product_id,symbol,event_type,received_at,exchange_time,source_event_id,
+                 sequence,integrity,payload_json)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(product_id,event_type,source_event_id)
+                WHERE source_event_id IS NOT NULL DO NOTHING
+            """, (
+                str(product_id), symbol, event_type, _iso(received_at),
+                _iso(exchange_time) if exchange_time else None, source_event_id,
+                sequence, integrity, _json(payload),
+            ))
+
+    def list_market_events(
+        self,
+        limit: int = 100,
+        product_id: str | None = None,
+        event_type: str | None = None,
+    ) -> dict:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        conditions = []
+        params: list[object] = []
+        if product_id is not None:
+            conditions.append("product_id=?")
+            params.append(str(product_id))
+        if event_type:
+            conditions.append("event_type=?")
+            params.append(event_type)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        rows = self.connection.execute(f"""
+            SELECT id,product_id,symbol,event_type,received_at,exchange_time,
+                   source_event_id,sequence,integrity,payload_json
+            FROM market_events{where}
+            ORDER BY received_at DESC,id DESC LIMIT ?
+        """, (*params, limit)).fetchall()
+        return {
+            "items": [
+                dict(row) | {"payload": json.loads(row["payload_json"])}
+                for row in rows
+            ],
+        }
+
+    def record_stream_health(
+        self,
+        stream_id: str,
+        observed_at: datetime,
+        state: str,
+        connected: bool,
+        reconnects: int,
+        dropped_events: int,
+        symbols: Iterable[str],
+        last_event_at: datetime | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        if not stream_id.strip() or not state.strip():
+            raise ValueError("stream health identity and state are required")
+        if reconnects < 0 or dropped_events < 0:
+            raise ValueError("stream health counters cannot be negative")
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO stream_health
+                (stream_id,observed_at,state,connected,reconnects,dropped_events,
+                 last_event_at,last_error,symbols_json)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                stream_id, _iso(observed_at), state, int(connected), reconnects,
+                dropped_events, _iso(last_event_at) if last_event_at else None,
+                last_error, _json(sorted(set(symbols))),
+            ))
+
+    def list_stream_health(self, limit: int = 50) -> dict:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        rows = self.connection.execute("""
+            SELECT h.stream_id,h.observed_at,h.state,h.connected,h.reconnects,
+                   h.dropped_events,h.last_event_at,h.last_error,h.symbols_json
+            FROM stream_health h
+            JOIN (
+                SELECT stream_id,MAX(id) AS latest_id
+                FROM stream_health GROUP BY stream_id
+            ) latest ON latest.latest_id=h.id
+            ORDER BY h.observed_at DESC,h.id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        return {
+            "items": [
+                dict(row) | {
+                    "connected": bool(row["connected"]),
+                    "symbols": json.loads(row["symbols_json"]),
+                }
+                for row in rows
+            ],
         }
 
     def list_instrument_rows(
@@ -576,6 +724,186 @@ class ResearchDataStore:
             "offset": offset,
         }
 
+    def strategy_leaderboard(self, limit: int = 50) -> dict:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+
+        def execution_config(config: dict) -> dict:
+            nested = config.get("portfolio", {})
+            return {
+                key: config.get(key, nested.get(key))
+                for key in (
+                    "initial_equity", "max_open_positions",
+                    "max_portfolio_risk_pct", "max_gross_leverage",
+                    "max_pairwise_correlation", "correlation_lookback_minutes",
+                    "minimum_correlation_observations", "trade_risk_pct",
+                    "trade_leverage", "fee_rate", "spread_bps", "slippage_bps",
+                )
+            }
+
+        rows = self.connection.execute("""
+            SELECT experiment_id,strategy_id,strategy_version,dataset_version,
+                   created_at,split_json,config_json,metrics_json
+            FROM experiments
+            WHERE status='completed' AND experiment_id LIKE 'wf-%'
+            ORDER BY created_at DESC,experiment_id LIMIT 10000
+        """).fetchall()
+        groups: dict[str, dict[str, list[dict]]] = {}
+        for row in rows:
+            experiment_id = row["experiment_id"]
+            parts = experiment_id.split("-")
+            run_id = (
+                "-".join(parts[:2])
+                if len(parts) > 2 and parts[0] == "wf" else experiment_id
+            )
+            group_key = f"{row['dataset_version']}:{run_id}"
+            metrics = json.loads(row["metrics_json"])
+            summary = metrics.get("summary", {})
+            if not isinstance(summary, dict) or not summary:
+                continue
+            groups.setdefault(group_key, {}).setdefault(row["strategy_id"], []).append({
+                "experiment_id": experiment_id,
+                "strategy_version": row["strategy_version"],
+                "dataset_version": row["dataset_version"],
+                "created_at": row["created_at"],
+                "split": json.loads(row["split_json"]),
+                "config": json.loads(row["config_json"]),
+                "metrics": metrics,
+            })
+
+        comparisons = []
+        for group_key, strategies in groups.items():
+            comparison_entries = []
+            period_sets = set()
+            execution_sets = set()
+            periods_complete = True
+            assumptions_complete = True
+            for strategy_id, experiments in strategies.items():
+                experiments.sort(key=lambda item: (
+                    item["split"].get("fold", -1),
+                    item["split"].get("out_of_sample_start", ""),
+                ))
+                summaries = [item["metrics"].get("summary", {}) for item in experiments]
+                pnl_values = [
+                    float(item["net_pnl_total"]) for item in summaries
+                    if item.get("net_pnl_total") is not None
+                ]
+                total_trades = sum(
+                    int(item.get("costed_simulated_count", 0)) for item in summaries
+                )
+                net_total = sum(pnl_values) if pnl_values else None
+                portfolio_drawdowns = [
+                    item["metrics"].get("portfolio", {}).get("max_drawdown_pct")
+                    for item in experiments
+                    if item["metrics"].get("portfolio", {}).get("max_drawdown_pct") is not None
+                ]
+                first = experiments[0]
+                periods = tuple(sorted(
+                    (
+                        item["split"].get("out_of_sample_start"),
+                        item["split"].get("out_of_sample_end"),
+                    )
+                    for item in experiments
+                ))
+                period_sets.add(periods)
+                periods_complete = periods_complete and all(
+                    start is not None and end is not None for start, end in periods
+                )
+                execution_sets.update(
+                    json.dumps(execution_config(item["config"]), sort_keys=True)
+                    for item in experiments
+                )
+                assumptions_complete = assumptions_complete and all(
+                    execution_config(item["config"]).get(key) is not None
+                    for item in experiments
+                    for key in (
+                        "initial_equity", "max_open_positions",
+                        "max_portfolio_risk_pct", "max_gross_leverage",
+                        "max_pairwise_correlation", "correlation_lookback_minutes",
+                        "minimum_correlation_observations", "trade_risk_pct",
+                        "trade_leverage", "fee_rate", "spread_bps", "slippage_bps",
+                    )
+                )
+                comparison_entries.append({
+                    "strategy_id": strategy_id,
+                    "strategy_version": first["strategy_version"],
+                    "dataset_version": first["dataset_version"],
+                    "experiment_ids": [item["experiment_id"] for item in experiments],
+                    "fold_count": len(experiments),
+                    "oos_periods": [
+                        {
+                            "start": item["split"].get("out_of_sample_start"),
+                            "end": item["split"].get("out_of_sample_end"),
+                        }
+                        for item in experiments
+                    ],
+                    "net_pnl_total": net_total,
+                    "costed_trade_count": total_trades,
+                    "net_expectancy_per_trade": (
+                        net_total / total_trades if net_total is not None and total_trades else None
+                    ),
+                    "max_fold_drawdown_pct": (
+                        max(portfolio_drawdowns) if portfolio_drawdowns else None
+                    ),
+                    "execution_config": execution_config(first["config"]),
+                    "aggregate_basis": (
+                        "sum of independent OOS fold PnL; folds are not compounded; "
+                        "drawdown is the maximum reported fold drawdown"
+                    ),
+                })
+            comparable = (
+                len(period_sets) == 1
+                and len(execution_sets) == 1
+                and periods_complete
+                and assumptions_complete
+            )
+            best_standalone = max(
+                (
+                    item["net_pnl_total"] for item in comparison_entries
+                    if item["strategy_id"] != "validated_strategy_selector"
+                    and item["net_pnl_total"] is not None
+                ),
+                default=None,
+            )
+            if not comparable:
+                best_standalone = None
+            for item in comparison_entries:
+                item["comparable_periods_and_assumptions"] = comparable
+                item["best_standalone_net_pnl"] = best_standalone
+                if item["strategy_id"] == "validated_strategy_selector":
+                    item["difference_to_best_standalone"] = (
+                        item["net_pnl_total"] - best_standalone
+                        if item["net_pnl_total"] is not None and best_standalone is not None
+                        else None
+                    )
+            comparisons.append({
+                "comparison_set_id": group_key,
+                "created_at": max(
+                    item["created_at"]
+                    for experiments in strategies.values()
+                    for item in experiments
+                ),
+                "comparable_periods_and_assumptions": comparable,
+                "strategies": sorted(
+                    comparison_entries,
+                    key=lambda item: (
+                        item["net_pnl_total"] is None,
+                        -(item["net_pnl_total"] or 0.0),
+                    ),
+                ),
+            })
+        comparisons.sort(key=lambda item: item["created_at"], reverse=True)
+        return {
+            "comparisons": comparisons[:limit],
+            "total_comparison_sets": len(comparisons),
+            "examined_experiments": len(rows),
+            "truncated": len(rows) == 10_000,
+            "ranking_basis": (
+                "net PnL after recorded costs, meaningful only where OOS periods "
+                "and execution assumptions match"
+            ),
+        }
+
     def save_paper_simulation(self, result, experiment_id: str | None = None) -> None:
         payload = result.__dict__ if hasattr(result, "__dict__") else dict(result)
         with self.connection:
@@ -708,6 +1036,9 @@ class ResearchDataStore:
             ).fetchone()[0],
             "funding_observation_count": self.connection.execute(
                 "SELECT COUNT(*) FROM funding"
+            ).fetchone()[0],
+            "market_event_count": self.connection.execute(
+                "SELECT COUNT(*) FROM market_events"
             ).fetchone()[0],
             "experiment_count": self.connection.execute(
                 "SELECT COUNT(*) FROM experiments"

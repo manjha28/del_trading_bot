@@ -79,6 +79,52 @@ class PaperSimulatorTests(unittest.TestCase):
         self.assertGreater(result.fees, 0)
         self.assertEqual(result.equity_after, 10_000 + result.net_pnl)
 
+    def test_fold_boundary_excludes_future_target_and_marks_open_trade(self):
+        boundary = T0 + timedelta(minutes=2)
+        bars = [
+            candle(T0, 100, 101, 99, 100),
+            candle(T0 + timedelta(minutes=1), 100, 104, 99, 103),
+            candle(T0 + timedelta(minutes=2), 103, 112, 102, 110),
+        ]
+        result = PaperSimulator().simulate(
+            signal(target=110), instrument(), bars, 10_000,
+            max_exit_time=boundary,
+        )
+        self.assertEqual(result.status, "simulated")
+        self.assertEqual(result.exit_reason, "FOLD_END")
+        self.assertEqual(result.exit_time, boundary.isoformat())
+        self.assertLess(result.exit_price, 110)
+        self.assertTrue(any("fold boundary" in item for item in result.assumptions))
+
+    def test_fold_boundary_excludes_candle_that_closes_after_boundary(self):
+        boundary = T0 + timedelta(seconds=90)
+        bars = [
+            candle(T0, 100, 101, 99, 100),
+            candle(T0 + timedelta(minutes=1), 100, 112, 99, 110),
+        ]
+        result = PaperSimulator().simulate(
+            signal(target=110), instrument(), bars, 10_000,
+            max_exit_time=boundary,
+        )
+        self.assertEqual(result.status, "simulated")
+        self.assertEqual(result.exit_reason, "FOLD_END")
+        self.assertEqual(result.exit_time, (T0 + timedelta(minutes=1)).isoformat())
+        self.assertNotEqual(result.exit_price, 110)
+
+    def test_fold_boundary_must_be_timezone_aware_and_after_decision(self):
+        simulator = PaperSimulator()
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            simulator.simulate(
+                signal(), instrument(), [candle(T0, 100, 101, 99, 100)], 1000,
+                max_exit_time=datetime(2026, 1, 1, 0, 2),
+            )
+        rejected = simulator.simulate(
+            signal(), instrument(), [candle(T0, 100, 101, 99, 100)], 1000,
+            max_exit_time=T0,
+        )
+        self.assertEqual(rejected.status, "rejected")
+        self.assertIn("boundary", rejected.reason)
+
     def test_stop_wins_ambiguous_same_bar_and_gap_stops_fill_worse(self):
         simulator = PaperSimulator(PaperSimulationConfig(spread_bps=0, slippage_bps=0))
         ambiguous = simulator.simulate(

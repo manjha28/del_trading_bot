@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import tempfile
 import unittest
@@ -79,6 +80,24 @@ class FixtureProvider:
         raise AssertionError("unsupported funding endpoint must not be called")
 
 
+class OneMinuteHistoryProvider(FixtureProvider):
+    def __init__(self, missing_middle=False):
+        super().__init__()
+        self.missing_middle = missing_middle
+
+    def fetch_candles(self, instrument, timeframe, start_ts, end_ts):
+        starts = [0, 120] if self.missing_middle else [0, 60, 120]
+        return [
+            Candle(
+                instrument.product_id, instrument.symbol, "1m",
+                datetime.fromtimestamp(start_ts + offset, UTC),
+                100 + offset / 60, 102 + offset / 60, 99 + offset / 60,
+                101 + offset / 60, 2, "fixture", True,
+            )
+            for offset in starts
+        ]
+
+
 class ResearchCollectorTests(unittest.TestCase):
     def test_collection_persists_supported_data_and_explicit_gaps(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -111,13 +130,53 @@ class ResearchCollectorTests(unittest.TestCase):
             )
             store.close()
 
+    def test_derives_aligned_candles_only_from_complete_source_intervals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResearchDataStore(Path(directory) / "research.sqlite3")
+            provider = OneMinuteHistoryProvider()
+            collector = ResearchCollector(provider, store)
+            collector.reconcile_universe()
+            start = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp())
+            result = collector.capture(
+                provider.instrument, "3m", start, start + 180
+            )
+            self.assertEqual(result["candles"], 1)
+            self.assertEqual(result["source_candles"], 3)
+            self.assertEqual(result["derived_candles"], 1)
+            candle = store.load_candles("1", "3m")[0]
+            self.assertTrue(candle.is_derived)
+            self.assertEqual(candle.source, "derived:1m:fixture")
+            self.assertEqual(candle.volume, 6)
+            self.assertEqual((candle.high, candle.low, candle.close), (104, 99, 103))
+            store.close()
+
+    def test_missing_source_minute_does_not_create_aggregate_bar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResearchDataStore(Path(directory) / "research.sqlite3")
+            provider = OneMinuteHistoryProvider(missing_middle=True)
+            collector = ResearchCollector(provider, store)
+            collector.reconcile_universe()
+            start = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp())
+            result = collector.capture(
+                provider.instrument, "3m", start, start + 180
+            )
+            self.assertEqual(result["candles"], 0)
+            self.assertEqual(store.load_candles("1", "3m"), [])
+            quality = store.instrument_detail("1")["data_quality"]
+            target = next(item for item in quality if item["data_type"] == "candles:3m")
+            self.assertEqual(target["state"], "unavailable")
+            store.close()
+
     def test_collection_rejects_unsupported_timeframe_without_network_calls(self):
         provider = FixtureProvider()
+        provider.capabilities = replace(
+            provider.capabilities, candle_timeframes=frozenset()
+        )
         with tempfile.TemporaryDirectory() as directory:
             store = ResearchDataStore(Path(directory) / "research.sqlite3")
             collector = ResearchCollector(provider, store)
             collector.reconcile_universe()
-            with self.assertRaisesRegex(UnsupportedCapabilityError, "does not provide 5m"):
+            with self.assertRaisesRegex(UnsupportedCapabilityError, "cannot provide or derive 5m"):
                 collector.capture(provider.instrument, "5m", 1, 301)
             store.close()
 

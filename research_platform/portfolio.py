@@ -90,9 +90,15 @@ class PortfolioPaperSimulator:
         instruments: Mapping[str, Instrument],
         candles_by_product: Mapping[str, Sequence[Candle]],
         initial_equity: float,
+        *,
+        max_exit_time: datetime | None = None,
     ) -> PortfolioSimulationResult:
         if not math.isfinite(initial_equity) or initial_equity <= 0:
             raise ValueError("initial_equity must be positive and finite")
+        if max_exit_time is not None and (
+            max_exit_time.tzinfo is None or max_exit_time.utcoffset() is None
+        ):
+            raise ValueError("max_exit_time must be timezone-aware")
         ordered = sorted(
             enumerate(signals),
             key=lambda item: (item[1].decision_time, item[0]),
@@ -143,12 +149,22 @@ class PortfolioPaperSimulator:
                 outcomes.append(self._reject(signal, equity, "instrument or candles unavailable"))
                 continue
 
-            candidate = self.simulator.simulate(signal, instrument, bars, equity)
+            candidate = self.simulator.simulate(
+                signal, instrument, bars, equity, max_exit_time=max_exit_time
+            )
             if candidate.status != "simulated":
                 outcomes.append(candidate)
                 continue
             entry_at = datetime.fromisoformat(candidate.entry_time)
             settle(entry_at)
+            if candidate.equity_before != equity:
+                candidate = self.simulator.simulate(
+                    signal, instrument, bars, equity,
+                    max_exit_time=max_exit_time,
+                )
+                if candidate.status != "simulated":
+                    outcomes.append(candidate)
+                    continue
 
             specs = instrument.contract_specs
             if specs is None or not specs.verified or specs.contract_multiplier is None:

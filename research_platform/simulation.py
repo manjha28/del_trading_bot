@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import math
 from typing import Iterable
 
@@ -67,6 +68,8 @@ class PaperSimulator:
         instrument: Instrument,
         candles: Iterable[Candle],
         equity: float,
+        *,
+        max_exit_time: datetime | None = None,
     ) -> PaperTradeResult:
         if not math.isfinite(equity) or equity <= 0:
             raise ValueError("equity must be positive and finite")
@@ -74,6 +77,12 @@ class PaperSimulator:
             raise ValueError("signal and instrument identity do not match")
         if signal.decision_time.tzinfo is None or signal.decision_time.utcoffset() is None:
             raise ValueError("signal decision time must be timezone-aware")
+        if max_exit_time is not None:
+            if max_exit_time.tzinfo is None or max_exit_time.utcoffset() is None:
+                raise ValueError("max_exit_time must be timezone-aware")
+            max_exit_time = max_exit_time.astimezone(timezone.utc)
+            if max_exit_time <= signal.decision_time.astimezone(timezone.utc):
+                return self._rejected(signal, equity, "fold boundary is not after decision time")
         specs = instrument.contract_specs
         if specs is None or not specs.verified:
             return self._rejected(signal, equity, "contract specifications are not verified")
@@ -91,7 +100,11 @@ class PaperSimulator:
             return self._rejected(signal, equity, "incomplete candle supplied to simulator")
         if any(a.start_time >= b.start_time for a, b in zip(bars, bars[1:])):
             return self._rejected(signal, equity, "candles must be strictly chronological and unique")
-        future = [bar for bar in bars if bar.start_time >= signal.decision_time]
+        future = [
+            bar for bar in bars
+            if bar.start_time >= signal.decision_time
+            and (max_exit_time is None or bar.close_time <= max_exit_time)
+        ]
         if not future:
             return self._rejected(signal, equity, "no candle at or after the signal decision time")
 
@@ -209,6 +222,10 @@ class PaperSimulator:
                 close_bar, exit_reason = bar, "MAX_HOLD"
                 break
 
+        if close_bar is None and max_exit_time is not None and future:
+            close_bar = future[-1]
+            exit_raw = close_bar.close
+            exit_reason = "FOLD_END"
         if close_bar is None or exit_raw is None or exit_reason is None:
             return self._rejected(signal, equity, "no exit within supplied candles and holding limit")
 
@@ -228,6 +245,12 @@ class PaperSimulator:
             "fixed spread and slippage applied adversely to entry and exit",
             "fees charged on entry and exit notional",
             "stop takes precedence when stop and target both touch in one OHLCV candle",
+            (
+                f"open position is closed at the last eligible candle close at fold boundary "
+                f"{max_exit_time.isoformat()}"
+                if exit_reason == "FOLD_END" and max_exit_time is not None
+                else "position exit uses only eligible candles within the supplied evaluation boundary"
+            ),
             "no queue priority, partial fills, market impact, funding cash flow, or portfolio netting modeled",
         )
         return PaperTradeResult(
@@ -239,7 +262,7 @@ class PaperSimulator:
             reason="paper simulation completed",
             decision_time=signal.decision_time.isoformat(),
             entry_time=entry_bar.start_time.isoformat(),
-            exit_time=close_bar.start_time.isoformat(),
+            exit_time=close_bar.close_time.isoformat(),
             entry_price=entry_price,
             exit_price=exit_price,
             stop_price=stop,

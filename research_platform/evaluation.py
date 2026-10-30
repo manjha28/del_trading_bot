@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Mapping, Sequence
 
 import pandas as pd
@@ -131,6 +131,7 @@ def evaluate_walk_forward_variants(
         fold_results = []
         oos_signal_products: set[str] = set()
         for fold_index, fold in enumerate(folds):
+            exit_boundary = fold.out_of_sample_end + timedelta(seconds=60)
             test_start = fold.validation_end + fold.embargo
             candidates = [
                 signal for signal in variant_signals
@@ -140,7 +141,7 @@ def evaluate_walk_forward_variants(
             candles_1m = {
                 product_id: [
                     candle for candle in candles
-                    if candle.start_time < fold.out_of_sample_end
+                    if candle.close_time <= exit_boundary
                 ]
                 for product_id, candles in all_candles_1m.items()
             }
@@ -149,6 +150,7 @@ def evaluate_walk_forward_variants(
                 instruments_by_id,
                 candles_1m,
                 initial_equity,
+                max_exit_time=exit_boundary,
             )
             per_symbol = {}
             for instrument in instruments:
@@ -242,10 +244,11 @@ def evaluate_walk_forward_variants(
             for signal in validation_candidates
         }
         validation_outcomes = []
+        validation_exit_boundary = fold.validation_end + timedelta(seconds=60)
         validation_candles = {
             product_id: [
                 candle for candle in candles
-                if candle.start_time < fold.validation_end
+                if candle.close_time <= validation_exit_boundary
             ]
             for product_id, candles in all_candles_1m.items()
         }
@@ -260,6 +263,7 @@ def evaluate_walk_forward_variants(
                     instruments_by_id,
                     validation_candles,
                     initial_equity,
+                    max_exit_time=validation_exit_boundary,
                 )
                 validation_outcomes.extend(validation_portfolio.outcomes)
         evidence = build_validation_evidence(
@@ -279,10 +283,11 @@ def evaluate_walk_forward_variants(
             for signal in oos_candidates
         }
         selection = selector.select(oos_candidates, evidence, oos_regimes)
+        oos_exit_boundary = fold.out_of_sample_end + timedelta(seconds=60)
         oos_candles = {
             product_id: [
                 candle for candle in candles
-                if candle.start_time < fold.out_of_sample_end
+                if candle.close_time <= oos_exit_boundary
             ]
             for product_id, candles in all_candles_1m.items()
         }
@@ -291,6 +296,7 @@ def evaluate_walk_forward_variants(
             instruments_by_id,
             oos_candles,
             initial_equity,
+            max_exit_time=oos_exit_boundary,
         )
         selection_folds.append({
             "fold": fold_index,

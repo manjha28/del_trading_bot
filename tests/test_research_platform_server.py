@@ -162,6 +162,97 @@ class ResearchPlatformServerTests(unittest.TestCase):
         _, filtered = self.get("/api/experiments?strategy_id=validated_strategy_selector")
         self.assertEqual(filtered["total"], 1)
 
+    def test_api_exposes_durable_stream_events_and_health(self):
+        timestamp = datetime(2026, 1, 2, tzinfo=UTC)
+        with ResearchDataStore(self.db_path) as store:
+            store.save_market_event(
+                "101", "TESTUSD", "ob_l2", timestamp,
+                {"book": {"buy": [], "sell": []}},
+                integrity="not_provided",
+            )
+            store.record_stream_health(
+                "delta-public-000", timestamp, "connected", True, 0, 0, ["TESTUSD"],
+            )
+
+        _, summary = self.get("/api/summary")
+        self.assertEqual(summary["market_event_count"], 1)
+        _, events = self.get("/api/market-events?event_type=ob_l2")
+        self.assertEqual(events["items"][0]["integrity"], "not_provided")
+        _, health = self.get("/api/stream-health")
+        self.assertTrue(health["items"][0]["connected"])
+        self.assertEqual(health["items"][0]["symbols"], ["TESTUSD"])
+
+    def test_leaderboard_aggregates_shared_oos_folds_and_compares_selector(self):
+        config = {
+            "initial_equity": 10_000,
+            "max_open_positions": 3,
+            "max_portfolio_risk_pct": 0.015,
+            "max_gross_leverage": 2.0,
+            "max_pairwise_correlation": 0.8,
+            "correlation_lookback_minutes": 60,
+            "minimum_correlation_observations": 30,
+            "trade_risk_pct": 0.005,
+            "trade_leverage": 2.0,
+            "fee_rate": 0.0005,
+            "spread_bps": 5,
+            "slippage_bps": 2,
+        }
+        split = {
+            "fold": 0,
+            "out_of_sample_start": "2026-01-08T00:00:00+00:00",
+            "out_of_sample_end": "2026-01-15T00:00:00+00:00",
+        }
+        with ResearchDataStore(self.db_path) as store:
+            for strategy_id, pnl in (
+                ("strategy_a", 10.0),
+                ("strategy_b", 5.0),
+                ("validated_strategy_selector", 12.0),
+            ):
+                store.save_experiment(
+                    f"wf-run99-{strategy_id}-000",
+                    strategy_id, "v1", "dataset-sha",
+                    split, config,
+                    {
+                        "summary": {
+                            "net_pnl_total": pnl,
+                            "costed_simulated_count": 2,
+                        },
+                        "portfolio": {"max_drawdown_pct": 0.02},
+                    },
+                    status="completed",
+                )
+        _, response = self.get("/api/leaderboard")
+        self.assertIn("meaningful only where OOS periods and execution assumptions match",
+                      response["ranking_basis"])
+        self.assertTrue(response["comparisons"][0]["comparable_periods_and_assumptions"])
+        entries = response["comparisons"][0]["strategies"]
+        self.assertEqual(entries[0]["strategy_id"], "validated_strategy_selector")
+        self.assertEqual(entries[0]["best_standalone_net_pnl"], 10.0)
+        self.assertEqual(entries[0]["difference_to_best_standalone"], 2.0)
+        self.assertEqual(entries[0]["costed_trade_count"], 2)
+
+        with ResearchDataStore(self.db_path) as store:
+            store.save_experiment(
+                "wf-runbad-strategy_a-000", "strategy_a", "v1", "dataset-sha",
+                split, config, {"summary": {"net_pnl_total": 10.0}}, status="completed",
+            )
+            mismatched = dict(config) | {"slippage_bps": 9}
+            store.save_experiment(
+                "wf-runbad-strategy_b-000", "strategy_b", "v1", "dataset-sha",
+                split, mismatched, {"summary": {"net_pnl_total": 11.0}},
+                status="completed",
+            )
+        _, response = self.get("/api/leaderboard")
+        unmatched = next(
+            item for item in response["comparisons"]
+            if item["comparison_set_id"].endswith(":wf-runbad")
+        )
+        self.assertFalse(unmatched["comparable_periods_and_assumptions"])
+        self.assertTrue(all(
+            item["best_standalone_net_pnl"] is None
+            for item in unmatched["strategies"]
+        ))
+
     def test_api_exposes_variant_gates_and_aggregates_existing_sources_read_only(self):
         _, variants = self.get("/api/variants")
         catalog = {item["strategy_id"]: item for item in variants["items"]}

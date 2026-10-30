@@ -54,6 +54,7 @@ class WalkForwardEvaluationTests(unittest.TestCase):
             [100, 105, 99, 104],
             [104, 105, 103, 104],
         ]
+        minute.loc[150, "high"] = 120.0
         universe = [
             verified_instrument(),
             Instrument("2", "NOHISTORYUSD", "perpetual_futures", "live"),
@@ -63,7 +64,7 @@ class WalkForwardEvaluationTests(unittest.TestCase):
             frame_times,
             train_end=T0 + timedelta(minutes=45),
             validation_end=T0 + timedelta(minutes=90),
-            out_of_sample_end=T0 + timedelta(minutes=145),
+            out_of_sample_end=T0 + timedelta(minutes=117),
         )
         report = evaluate_walk_forward_variants(
             universe,
@@ -80,6 +81,15 @@ class WalkForwardEvaluationTests(unittest.TestCase):
         self.assertEqual(sweep["portfolio"]["accepted_count"], 1)
         self.assertEqual(len(sweep["_outcomes"]), sweep["candidate_signal_count"])
         self.assertIn("simulated", {item["status"] for item in sweep["_outcomes"]})
+        simulated = [
+            item for item in sweep["_outcomes"] if item["status"] == "simulated"
+        ]
+        self.assertTrue(simulated)
+        self.assertTrue(all(item["exit_reason"] == "FOLD_END" for item in simulated))
+        self.assertTrue(all(
+            datetime.fromisoformat(item["exit_time"]) <= T0 + timedelta(minutes=118)
+            for item in simulated
+        ))
         self.assertEqual(sweep["per_symbol"]["1"]["coverage_state"], "signal")
         self.assertEqual(
             report["variants"]["liquidity_sweep_reclaim"]["symbols_with_signal"], 1

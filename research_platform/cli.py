@@ -80,17 +80,36 @@ def _run_scan(collector: ResearchCollector, args) -> dict:
 
 def _collect(args) -> int:
     collector, client, store = _collector(args)
+    capture = None
+    if args.websocket_capture:
+        from .live_capture import DurableMarketCapture
+
+        capture = DurableMarketCapture(store)
     try:
         while True:
             result = _run_scan(collector, args)
+            if capture is not None:
+                capture.sync_universe(store.list_instruments())
+                capture.drain()
             print(json.dumps(result, default=str, allow_nan=False), flush=True)
             if args.loop_seconds == 0:
                 return 1 if result["failures"] else 0
-            time.sleep(args.loop_seconds)
+            if capture is None:
+                time.sleep(args.loop_seconds)
+            else:
+                deadline = time.monotonic() + args.loop_seconds
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(1.0, remaining))
+                    capture.drain()
     except KeyboardInterrupt:
         logger.info("Collection stopped")
         return 0
     finally:
+        if capture is not None:
+            capture.close()
         store.close()
         close = getattr(client, "close", None)
         if callable(close):
@@ -321,6 +340,8 @@ def _backtest(args) -> int:
                         "max_pairwise_correlation": args.max_pairwise_correlation,
                         "correlation_lookback_minutes": args.correlation_lookback_minutes,
                         "minimum_correlation_observations": args.minimum_correlation_observations,
+                        "trade_risk_pct": args.trade_risk_pct,
+                        "trade_leverage": max(1.0, args.max_gross_leverage),
                         "fee_rate": args.fee_rate,
                         "spread_bps": args.spread_bps,
                         "slippage_bps": args.slippage_bps,
@@ -357,6 +378,11 @@ def _backtest(args) -> int:
                         "max_pairwise_correlation": args.max_pairwise_correlation,
                         "correlation_lookback_minutes": args.correlation_lookback_minutes,
                         "minimum_correlation_observations": args.minimum_correlation_observations,
+                        "trade_risk_pct": args.trade_risk_pct,
+                        "trade_leverage": max(1.0, args.max_gross_leverage),
+                        "fee_rate": args.fee_rate,
+                        "spread_bps": args.spread_bps,
+                        "slippage_bps": args.slippage_bps,
                     },
                 },
                 {
@@ -391,6 +417,10 @@ def main(argv=None) -> int:
     collect.add_argument("--lookback-hours", type=int, default=24)
     collect.add_argument("--loop-seconds", type=int, default=0,
                          help="repeat scans at this interval; zero performs one scan")
+    collect.add_argument(
+        "--websocket-capture", action="store_true",
+        help="persist public WebSocket events; requires --loop-seconds > 0",
+    )
 
     web = commands.add_parser("serve", help="run the read-only local dashboard")
     web.add_argument("--db", default="data/unified_research.sqlite3")
@@ -451,6 +481,8 @@ def main(argv=None) -> int:
         parser.error("--lookback-hours must be positive")
     if args.loop_seconds < 0:
         parser.error("--loop-seconds cannot be negative")
+    if args.websocket_capture and args.loop_seconds == 0:
+        parser.error("--websocket-capture requires a positive --loop-seconds")
     if args.timeframe is None:
         args.timeframe = "1h" if args.provider == "coin-research" else "15m"
     try:

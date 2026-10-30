@@ -19,6 +19,7 @@ from .market_data import (
 )
 from .store import ResearchDataStore
 from .collector import ResearchCollector
+from .live_capture import DurableMarketCapture
 from .strategies import (
     FastSlowMAAdapter,
     MHRExhaustionAdapter,
@@ -66,6 +67,7 @@ __all__ = [
     "ContractSpecifications",
     "CoinResearchAdapter",
     "DataQuality",
+    "DurableMarketCapture",
     "DeltaResearchAdapter",
     "FundingObservation",
     "ExitSimulationContext",

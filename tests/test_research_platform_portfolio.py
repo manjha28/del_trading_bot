@@ -13,7 +13,7 @@ UTC = timezone.utc
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def product(product_id, symbol):
+def product(product_id, symbol, lot_size=1, minimum_quantity=1):
     return Instrument.from_delta({
         "id": product_id,
         "symbol": symbol,
@@ -25,8 +25,8 @@ def product(product_id, symbol):
         "position_size_limit": "1000",
         "contract_spec_verification": {
             "spec_verified": True,
-            "lot_size": 1,
-            "minimum_order_contracts": 1,
+            "lot_size": lot_size,
+            "minimum_order_contracts": minimum_quantity,
             "verification_policy": "fixture",
             "verification_errors": [],
         },
@@ -150,6 +150,38 @@ class PortfolioSimulationTests(unittest.TestCase):
         self.assertEqual(result.rejected_count, 1)
         rejected = next(item for item in result.outcomes if item.status == "rejected")
         self.assertIn("already open", rejected.reason)
+
+    def test_sizing_uses_equity_settled_before_entry(self):
+        instrument = product("1", "AAAUSD", lot_size=0.1, minimum_quantity=0.1)
+        candles = [
+            Candle(
+                "1", "AAAUSD", "1m", T0 + timedelta(minutes=index),
+                100, 121 if index in (3, 4) else 101, 99, 100, 10,
+                "fixture", True,
+            )
+            for index in range(6)
+        ]
+        second_signal = signal(
+            "1", "AAAUSD", T0 + timedelta(minutes=3, seconds=30), "second"
+        )
+        simulator = PortfolioPaperSimulator()
+        result = simulator.simulate(
+            [
+                signal("1", "AAAUSD", T0, "first"),
+                second_signal,
+            ],
+            {"1": instrument},
+            {"1": candles},
+            10_000,
+        )
+        first, second = result.outcomes
+        self.assertEqual(first.exit_time, (T0 + timedelta(minutes=4)).isoformat())
+        self.assertEqual(second.status, "simulated")
+        initial_equity_candidate = simulator.simulator.simulate(
+            second_signal, instrument, candles, 10_000,
+        )
+        self.assertGreater(second.equity_before, initial_equity_candidate.equity_before)
+        self.assertGreater(second.quantity, initial_equity_candidate.quantity)
 
     def test_gross_exposure_constraint_fails_closed(self):
         simulator = PortfolioPaperSimulator(PortfolioSimulationConfig(

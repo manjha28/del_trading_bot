@@ -81,7 +81,10 @@ class ResearchPlatformCLITests(unittest.TestCase):
         with patch("research_platform.cli.logging.basicConfig"):
             with self.assertRaises(SystemExit) as result:
                 main(["collect", "--lookback-hours", "0"])
+            with self.assertRaises(SystemExit) as websocket_result:
+                main(["collect", "--websocket-capture"])
         self.assertEqual(result.exception.code, 2)
+        self.assertEqual(websocket_result.exception.code, 2)
 
     def test_evaluate_command_persists_no_signal_and_unavailable_states(self):
         with tempfile.TemporaryDirectory() as directory:

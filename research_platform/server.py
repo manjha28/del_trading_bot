@@ -42,6 +42,11 @@ def _read_external_sources(source_paths: dict[str, str | Path]) -> dict:
                 sources["coin_research"] = {
                     "status": "available",
                     "summary": store.summary(),
+                    "sleeping_candidates": store.list_products(
+                        state="sleeping", sort="sleeping_score", descending=True,
+                        limit=100,
+                    ),
+                    "recent_events": store.list_events(limit=100),
                     "event_outcomes": store.list_outcomes(limit=20)["items"],
                 }
         except (sqlite3.Error, OSError, ValueError):
@@ -176,7 +181,8 @@ def create_handler(
                             "canonical_timeframes": sorted(TIMEFRAME_SECONDS),
                             "stored_data_types": [
                                 "instruments", "candles", "tickers", "trades",
-                                "orderbook_snapshots", "funding", "data_quality",
+                                "orderbook_snapshots", "funding", "market_events",
+                                "stream_health", "data_quality",
                             ],
                             "not_implemented": [
                                 "orderbook_deltas", "open_interest_history",
@@ -203,6 +209,8 @@ def create_handler(
                                 "trade_outcome_persistence",
                                 "validation_only_regime_aware_strategy_selection",
                                 "same_direction_recent_return_correlation_gate",
+                                "durable_public_websocket_event_capture",
+                                "same_dataset_oos_strategy_leaderboard",
                             ],
                             "exit_adapter_limitations": [
                                 "legacy exit simulations do not apply fees or execution costs",
@@ -216,6 +224,17 @@ def create_handler(
                                 "OHLCV ambiguity resolved stop-first",
                             ],
                         }
+                    elif path == "/api/market-events":
+                        product_id = params.get("product_id", [None])[0]
+                        result = store.list_market_events(
+                            _integer(params, "limit", 100, MAX_LIMIT),
+                            product_id=product_id,
+                            event_type=params.get("event_type", [None])[0],
+                        )
+                    elif path == "/api/stream-health":
+                        result = store.list_stream_health(
+                            _integer(params, "limit", 50, MAX_LIMIT)
+                        )
                     elif path == "/api/variants":
                         result = {
                             "items": [
@@ -243,6 +262,10 @@ def create_handler(
                             _integer(params, "limit", 100, MAX_LIMIT),
                             _integer(params, "offset", 0, 10_000_000),
                             "validated_strategy_selector",
+                        )
+                    elif path == "/api/leaderboard":
+                        result = store.strategy_leaderboard(
+                            _integer(params, "limit", 50, MAX_LIMIT)
                         )
                     elif path == "/api/simulations":
                         result = store.list_paper_simulations(
