@@ -73,3 +73,27 @@ Paper-state JSON is stored under `data/` by default and is ignored by Git. Do no
 - The backtester assumes stop-first if stop and target touch in the same 1m candle, includes configured fees/slippage, and cannot model queue position or partial exchange fills.
 - Candle API history is chunked for backfill. Gaps, stale bars, incomplete bars, unknown contract multiplier/tick, missing spread quotes, or failed API requests cause no-trade behavior.
 - A paper result is not a profitability claim. Validate out-of-sample, per-symbol, per-regime and after realistic fees before considering any separate live execution project.
+
+
+## Strategy dashboard
+
+The optional Streamlit dashboard displays the backend scan response, contract verification diagnostics, Volume Profile levels, indicators, strategy signals, paper positions, pending entries, closed trades, and backtest results. It uses the existing VPVR scanner, engine, backtester and local JSON paper journal; it does not add an order API or a live-execution control.
+
+Install the dashboard dependency and run it from the repository root:
+
+```bash
+python -m pip install -r requirements-dashboard.txt
+streamlit run vpvr/dashboard.py
+```
+
+Open the local URL printed by Streamlit (normally http://localhost:8501).
+
+### Dashboard workflow
+
+1. Select BTCUSD and/or ETHUSD, choose signal-only or paper scan, and click **Fetch latest market data**.
+2. Inspect contract metadata verification, market regime, spread, funding, profile provenance, indicators, and all returned signals.
+3. Review the local paper journal. The paper scan may queue a virtual trigger; it cannot submit exchange orders.
+4. In Backtest workbench, upload aligned 1m, 3m and 15m OHLCV CSVs. When a recent scan has verified contract metadata, the backtester uses it. Otherwise, backtesting requires an explicit manual research-assumptions checkbox and labels the result as unverified; these values do not affect paper sizing.
+5. Use Raw backend data to inspect the complete JSON scan response.
+
+The dashboard does not automatically run continuous polling. Trigger a new scan manually to refresh the market snapshot. The paper journal is read from `VPVR_PAPER_STATE_FILE` (default `data/vpvr_paper_state.json`).
