@@ -275,7 +275,12 @@ class DeltaMarketData:
                 errors.append("minimum_order_cannot_be_normalized_without_contract_value")
 
         lot_increment_verified = policy is not None
-        minimum_verified = policy is not None and minimum_contracts is not None
+        minimum_verified = (
+            policy is not None
+            and minimum_contracts is not None
+            and multiplier == policy["contract_value"]
+            and str(product.get("contract_unit_currency") or "").upper() == policy["currency"]
+        )
         if not lot_increment_verified:
             errors.append("integer_contract_increment_not_verified_for_symbol")
 
