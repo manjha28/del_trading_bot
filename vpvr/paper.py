@@ -123,7 +123,7 @@ class PaperBroker:
         self._save()
         return True, "trigger queued"
 
-    def process_candle(self, symbol, candle, funding_rate=None):
+    def process_candle(self, symbol, candle, funding_event=None):
         """Process one unique completed 1m candle for a symbol."""
         timestamp = pd.Timestamp(candle["time"])
         last = self.state["last_processed"].get(symbol)
@@ -148,7 +148,7 @@ class PaperBroker:
                     position["stop"] = max(position["stop"], float(prior_low) * (1 - self.trailing_buffer_pct))
                 elif position["direction"] == "SHORT" and prior_high is not None:
                     position["stop"] = min(position["stop"], float(prior_high) * (1 + self.trailing_buffer_pct))
-            self._apply_funding(position, timestamp, funding_rate, events)
+            self._apply_funding(position, timestamp, funding_event, events)
             direction = position["direction"]
             stop_hit = low <= position["stop"] if direction == "LONG" else high >= position["stop"]
             if stop_hit:
@@ -227,7 +227,7 @@ class PaperBroker:
                 symbol=symbol, strategy=pending["strategy"], direction=direction, entry=fill,
                 stop=stop, targets=list(pending["targets"]), quantity=qty, remaining=qty,
                 opened_at=timestamp.isoformat(), entry_fee=fee, contract_multiplier=multiplier,
-                fees=fee, realized_pnl=-fee, last_funding_at=timestamp.isoformat(),
+                fees=fee, realized_pnl=-fee, last_funding_at=None,
                 last_mark=fill, last_candle_low=low, last_candle_high=high, regime=pending["regime"]
             ))
             self.state["balance"] -= fee
@@ -238,21 +238,42 @@ class PaperBroker:
         self._save()
         return events
 
-    def _apply_funding(self, position, timestamp, funding_rate, events):
-        if funding_rate is None or position.get("last_funding_at") is None:
+    def _apply_funding(self, position, candle_start, funding_event, events):
+        """Apply only an explicit, timestamped funding realization event.
+
+        A current funding-rate quote is not proof that a settlement occurred.
+        Never accrue synthetic 8-hour periods from the entry timestamp.
+        """
+        if not isinstance(funding_event, dict):
             return
-        previous = pd.Timestamp(position["last_funding_at"])
-        periods = int((timestamp - previous).total_seconds() // 28800)
-        if periods <= 0:
+        try:
+            event_time = pd.Timestamp(funding_event["timestamp"])
+            rate = float(funding_event["rate"])
+        except (KeyError, TypeError, ValueError):
             return
-        rate = float(funding_rate)
-        notional = position["remaining"] * position["entry"] * position["contract_multiplier"]
-        cash_flow = -notional * rate * periods if position["direction"] == "LONG" else notional * rate * periods
-        position["funding_paid"] += -cash_flow
-        position["realized_pnl"] += cash_flow
+        candle_start = pd.Timestamp(candle_start)
+        candle_end = candle_start + pd.Timedelta(minutes=1)
+        if event_time.tzinfo is None:
+            event_time = event_time.tz_localize("UTC")
+        else:
+            event_time = event_time.tz_convert("UTC")
+        if not (candle_start < event_time <= candle_end):
+            return
+        if event_time <= pd.Timestamp(position["opened_at"]):
+            return
+        if position.get("last_funding_at") == event_time.isoformat():
+            return
+        notional = (float(position["remaining"]) * float(position["entry"]) *
+                    float(position["contract_multiplier"]))
+        cash_flow = (-notional * rate if position["direction"] == "LONG"
+                     else notional * rate)
+        position["funding_paid"] = float(position.get("funding_paid", 0.0)) - cash_flow
+        position["realized_pnl"] = float(position.get("realized_pnl", 0.0)) + cash_flow
+        position["last_funding_at"] = event_time.isoformat()
         self.state["balance"] += cash_flow
-        position["last_funding_at"] = (previous + pd.Timedelta(seconds=28800 * periods)).isoformat()
-        events.append({"symbol": position["symbol"], "event": "funding", "cash_flow": cash_flow})
+        events.append({"symbol": position["symbol"], "event": "funding",
+                       "timestamp": event_time.isoformat(), "rate": rate,
+                       "cash_flow": cash_flow, "source": funding_event.get("source", "explicit_event")})
 
     def _close(self, symbol, price, reason, timestamp, events):
         position = self.state["positions"][symbol]
