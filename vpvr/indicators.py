@@ -70,20 +70,32 @@ def trade_delta_bars(trades: pd.DataFrame | None, timeframe: str = "1min") -> pd
 
 
 def delta_divergence(candles: pd.DataFrame, delta_bars: pd.DataFrame, lookback: int = 5) -> dict:
-    """Compare consecutive price swing extremes with genuine aggressor CVD swing extremes."""
-    if lookback<3 or candles is None or delta_bars is None or len(candles)<lookback or len(delta_bars)<lookback:
-        return {"available":False,"bullish":False,"bearish":False,"reason":"insufficient aligned price and trade-delta history"}
-    if "cvd" not in delta_bars:
-        return {"available":False,"bullish":False,"bearish":False,"reason":"CVD series unavailable"}
-    price=pd.to_numeric(candles.close.tail(lookback),errors="coerce").reset_index(drop=True)
-    cvd=pd.to_numeric(delta_bars.cvd.tail(lookback),errors="coerce").reset_index(drop=True)
+    """Compare aligned price swing extremes with genuine aggressor CVD swing extremes."""
+    if lookback < 4 or candles is None or delta_bars is None or len(candles) < lookback:
+        return {"available": False, "bullish": False, "bearish": False,
+                "reason": "insufficient aligned price and trade-delta history"}
+    if "time" not in candles or "cvd" not in delta_bars:
+        return {"available": False, "bullish": False, "bearish": False,
+                "reason": "timestamped CVD series unavailable"}
+    price_frame = candles.tail(lookback).copy()
+    price_frame["time"] = pd.to_datetime(price_frame.time, utc=True).dt.floor("min")
+    cvd_frame = delta_bars.copy()
+    cvd_frame.index = pd.to_datetime(cvd_frame.index, utc=True).floor("min")
+    joined = price_frame.set_index("time").join(cvd_frame[["cvd"]], how="left")
+    if joined.cvd.isna().mean() > 0.20:
+        return {"available": False, "bullish": False, "bearish": False,
+                "reason": "trade tape does not cover enough matching 1m bars"}
+    price = pd.to_numeric(joined.close, errors="coerce").reset_index(drop=True)
+    cvd = pd.to_numeric(joined.cvd, errors="coerce").reset_index(drop=True)
     if price.isna().any() or cvd.isna().any():
-        return {"available":False,"bullish":False,"bearish":False,"reason":"price/CVD contains missing values"}
-    mid=max(1,lookback//2)
-    price_low_1=float(price.iloc[:mid].min());price_low_2=float(price.iloc[mid:].min())
-    cvd_low_1=float(cvd.iloc[:mid].min());cvd_low_2=float(cvd.iloc[mid:].min())
-    price_high_1=float(price.iloc[:mid].max());price_high_2=float(price.iloc[mid:].max())
-    cvd_high_1=float(cvd.iloc[:mid].max());cvd_high_2=float(cvd.iloc[mid:].max())
-    bullish=price_low_2<price_low_1 and cvd_low_2>cvd_low_1
-    bearish=price_high_2>price_high_1 and cvd_high_2<cvd_high_1
-    return {"available":True,"bullish":bullish,"bearish":bearish,"reason":None}
+        return {"available": False, "bullish": False, "bearish": False,
+                "reason": "price/CVD contains missing values"}
+    mid = max(2, lookback // 2)
+    price_low_1, price_low_2 = float(price.iloc[:mid].min()), float(price.iloc[mid:].min())
+    cvd_low_1, cvd_low_2 = float(cvd.iloc[:mid].min()), float(cvd.iloc[mid:].min())
+    price_high_1, price_high_2 = float(price.iloc[:mid].max()), float(price.iloc[mid:].max())
+    cvd_high_1, cvd_high_2 = float(cvd.iloc[:mid].max()), float(cvd.iloc[mid:].max())
+    return {"available": True,
+            "bullish": price_low_2 < price_low_1 and cvd_low_2 > cvd_low_1,
+            "bearish": price_high_2 > price_high_1 and cvd_high_2 < cvd_high_1,
+            "reason": None}
