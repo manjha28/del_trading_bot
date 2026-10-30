@@ -15,7 +15,17 @@ class VolumeProfile:
     prices: tuple[float,...]; volumes: tuple[float,...]; poc: float; vah: float; val: float
     hvns: tuple[float,...]; lvns: tuple[float,...]; total_volume: float; source: str
     start: pd.Timestamp|None=None; end: pd.Timestamp|None=None
-    def as_dict(self): return {"poc":self.poc,"vah":self.vah,"val":self.val,"hvns":list(self.hvns),"lvns":list(self.lvns),"total_volume":self.total_volume,"source":self.source,"rows":len(self.prices),"start":str(self.start) if self.start is not None else None,"end":str(self.end) if self.end is not None else None}
+    def as_dict(self):
+        return {
+            "poc": self.poc, "vah": self.vah, "val": self.val,
+            "hvns": list(self.hvns), "lvns": list(self.lvns),
+            "total_volume": self.total_volume, "source": self.source,
+            "rows": len(self.prices),
+            "price_levels": list(self.prices),
+            "volume_at_price": list(self.volumes),
+            "start": str(self.start) if self.start is not None else None,
+            "end": str(self.end) if self.end is not None else None,
+        }
 
 def _value_area(volumes,prices,fraction):
     if len(volumes)==0 or volumes.sum()<=0: raise ValueError("profile has no positive volume")
