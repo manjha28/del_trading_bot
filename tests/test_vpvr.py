@@ -322,7 +322,7 @@ class BacktestTests(unittest.TestCase):
 
     def test_backtest_quantity_rejects_minimum_exceeding_risk_budget(self):
         qty,_=_quantity(1000,100,99.9,"LONG",1.0,BacktestConfig(),
-            lot_size=1,min_qty=10,tick_size=.01)
+            lot_size=1,min_qty=30,tick_size=.01)
         self.assertEqual(qty,0.0)
 
     def test_completed_history_excludes_current_forming_1m_bar(self):
