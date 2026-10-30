@@ -68,7 +68,11 @@ class RiskEngine:
         if tick_size is not None:
             if tick_size<=0:
                 return RiskDecision(False,"invalid tick size")
-            stop=round(stop/tick_size)*tick_size
+            # Round away from entry so tick adjustment never understates risk.
+            if direction == "LONG":
+                stop = math.floor(stop / tick_size + 1e-12) * tick_size
+            else:
+                stop = math.ceil(stop / tick_size - 1e-12) * tick_size
             distance=(entry-stop) if direction=="LONG" else (stop-entry)
             if distance<=0:
                 return RiskDecision(False,"tick rounding invalidated stop")
