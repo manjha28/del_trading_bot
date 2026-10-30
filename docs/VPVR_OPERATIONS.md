@@ -68,8 +68,8 @@ Paper-state JSON is stored under `data/` by default and is ignored by Git. Do no
 - Session VWAP currently resets at UTC midnight. Configure a different session definition before using it for non-UTC exchange sessions.
 
 ## Data limitations and operational cautions
-- Current Delta product metadata reliably exposes contract value and tick size. Lot increment/minimum quantity fields are not guaranteed by the inspected public product schema. The paper adapter marks its 1-contract fallback as unverified. Do not use this metadata assumption for live orders.
-- Order-book depth, spreads, current funding and public trade prints are diagnostic inputs. Historical funding is not included in the first backtest engine.
+- Delta product metadata may omit lot increments/minimum quantities. The paper adapter marks a 1-contract fallback as unverified. This is a simulation assumption only and must never be reused for live sizing.
+- Order-book depth, spreads, funding-rate quotes and public trade prints are diagnostics. The paper broker charges funding only when supplied an explicit timestamped funding-settlement event; a rate quote alone does not prove settlement and is not accrued. The REST polling loop currently reports the funding rate but does not source settlement events, so its paper PnL does not include funding. Historical funding is not included in the first backtest engine.
 - The backtester assumes stop-first if stop and target touch in the same 1m candle, includes configured fees/slippage, and cannot model queue position or partial exchange fills.
 - Candle API history is chunked for backfill. Gaps, stale bars, incomplete bars, unknown contract multiplier/tick, missing spread quotes, or failed API requests cause no-trade behavior.
 - A paper result is not a profitability claim. Validate out-of-sample, per-symbol, per-regime and after realistic fees before considering any separate live execution project.
