@@ -136,6 +136,37 @@ class PaperTests(unittest.TestCase):
             self.assertNotIn("BTCUSD",broker.state["positions"])
             self.assertEqual(broker.state["trades"][-1]["exit_reason"],"STOP")
 
+    def test_two_targets_leave_runner_and_trail_structurally(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker=PaperBroker(Path(directory)/"paper.json",initial_balance=1000,
+                fee_rate=0,slippage_bps=0,trailing_buffer_pct=.001)
+            broker.queue_signal(self.signal(),1)
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:00:00Z",100,102,100,101))
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:01:00Z",100,102,100,101))
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:02:00Z",101,106,101,105))
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:03:00Z",106,110,106,109))
+            position=broker.state["positions"]["BTCUSD"]
+            self.assertAlmostEqual(position["remaining"],.25)
+            self.assertEqual(position["target_index"],2)
+            self.assertEqual(position["stop"],105.0)
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:04:00Z",108,109,107,108))
+            tightened=broker.state["positions"]["BTCUSD"]["stop"]
+            self.assertGreater(tightened,105.0)
+            events=broker.process_candle("BTCUSD",self.candle("2026-01-01T00:05:00Z",106,108,105.8,106))
+            self.assertTrue(any(e.get("reason")=="STOP_OR_TRAIL" for e in events))
+            self.assertNotIn("BTCUSD",broker.state["positions"])
+
+    def test_partial_target_then_tightened_stop_is_conservative_same_bar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker=PaperBroker(Path(directory)/"paper.json",initial_balance=1000,
+                fee_rate=0,slippage_bps=0)
+            broker.queue_signal(self.signal(),1)
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:00:00Z",100,102,100,101))
+            broker.process_candle("BTCUSD",self.candle("2026-01-01T00:01:00Z",100,102,100,101))
+            events=broker.process_candle("BTCUSD",self.candle("2026-01-01T00:02:00Z",101,106,100,103))
+            self.assertTrue(any(e.get("reason")=="SAME_BAR_TIGHTENED_STOP" for e in events))
+            self.assertNotIn("BTCUSD",broker.state["positions"])
+
     def test_corrupt_state_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/"paper.json";path.write_text("{broken")
