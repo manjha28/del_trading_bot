@@ -182,7 +182,8 @@ def scan_once(symbols, paper=False, config=None):
                     direction=signal.direction,leverage=cfg.default_leverage,
                     contract_multiplier=specs["contract_multiplier"],lot_size=specs["lot_size"],
                     min_qty=specs["min_qty"],tick_size=specs["tick_size"],
-                    fee_rate=cfg.fee_rate,slippage_bps=cfg.slippage_bps)
+                    fee_rate=cfg.fee_rate,slippage_bps=cfg.slippage_bps,
+                    max_qty=specs.get("position_size_limit"))
                 if not decision.accepted:
                     signal_rows.append({"signal":signal.as_dict(),"status":"risk_rejected","reason":decision.reason})
                     continue
