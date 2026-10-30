@@ -25,6 +25,7 @@ class BacktestConfig:
     min_reward_risk: float = 2.0
     volume_multiple: float = 1.0
     max_chase_bps: float = 10.0
+    trailing_buffer_pct: float = 0.001
 
 def _clean(frame):
     required = {"time","open","high","low","close","volume"}
@@ -110,6 +111,11 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
         # Existing position management: stop-first resolves same-bar ambiguity.
         if position:
             pos=position;direction=pos["direction"]
+            if pos["target_index"]>=2 and pos["remaining"]>1e-10:
+                if direction=="LONG" and pos.get("last_candle_low") is not None:
+                    pos["stop"]=max(pos["stop"],pos["last_candle_low"]*(1-cfg.trailing_buffer_pct))
+                elif direction=="SHORT" and pos.get("last_candle_high") is not None:
+                    pos["stop"]=min(pos["stop"],pos["last_candle_high"]*(1+cfg.trailing_buffer_pct))
             stop_hit=bar["low"]<=pos["stop"] if direction=="LONG" else bar["high"]>=pos["stop"]
             if stop_hit:
                 fill=pos["stop"]*(1-cfg.slippage_bps/10000 if direction=="LONG" else 1+cfg.slippage_bps/10000)
@@ -123,7 +129,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                 equity_curve.append(equity);position=None
             else:
                 targets=pos["targets"]
-                fractions=[1.0] if len(targets)==1 else ([.30,.70] if len(targets)==2 else [.30,.45,.25])
+                fractions=[1.0] if len(targets)==1 else ([.30,.45] if len(targets)==2 else [.30,.45,.25])
                 while pos["target_index"]<len(targets):
                     ix=pos["target_index"];target=targets[ix]
                     hit=bar["high"]>=target if direction=="LONG" else bar["low"]<=target
@@ -134,7 +140,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                     pos["gross_pnl"]+=gross;pos["fees"]+=fee;pos["net_pnl"]+=net
                     pos["remaining"]-=qty;equity+=net;pos["target_index"]+=1
                     if ix==0:pos["stop"]=pos["entry"]
-                    elif ix==1 and len(targets)>=3:pos["stop"]=targets[0]
+                    elif ix==1:pos["stop"]=targets[0]
                     if pos["remaining"]<=1e-10:break
                 if pos["remaining"]<=1e-10:
                     trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":targets[-1],"exit_reason":"TARGETS",
@@ -151,6 +157,9 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                         "holding_minutes":cfg.max_hold_minutes})
                     consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
                     equity_curve.append(equity);position=None
+                if position is pos:
+                    pos["last_candle_low"]=bar["low"]
+                    pos["last_candle_high"]=bar["high"]
 
         # Process an older queued trigger on this candle only.
         if pending and position is None:
@@ -176,7 +185,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                         position={"symbol":symbol,"strategy":sig.strategy,"direction":direction,"entry":fill,
                             "stop":sig.stop_loss,"targets":list(sig.targets[:3]),"quantity":qty,"remaining":qty,
                             "opened_at":ts.isoformat(),"target_index":0,"gross_pnl":0.0,"fees":fee,"net_pnl":-fee,
-                            "regime":pending["regime"]}
+                            "last_candle_low":bar["low"],"last_candle_high":bar["high"],"regime":pending["regime"]}
                         equity_curve.append(equity)
                     else:
                         skipped["risk_or_sizing_reject"]+=1
