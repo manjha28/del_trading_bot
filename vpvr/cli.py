@@ -212,6 +212,9 @@ def main(argv=None):
     bt.add_argument("--csv-1m",required=True);bt.add_argument("--csv-3m",required=True);bt.add_argument("--csv-15m",required=True)
     bt.add_argument("--initial-balance",type=float,default=1000)
     bt.add_argument("--contract-multiplier",type=float,default=1.0)
+    bt.add_argument("--lot-size",type=float,default=1.0)
+    bt.add_argument("--min-qty",type=float,default=1.0)
+    bt.add_argument("--tick-size",type=float,default=None)
     bt.add_argument("--output",default="vpvr_backtest.json")
     args=parser.parse_args(argv)
     cfg=VPVRConfig.from_env()
@@ -258,8 +261,10 @@ def main(argv=None):
                 value_area_pct=cfg.value_area_pct,min_reward_risk=cfg.min_reward_risk,
                 volume_multiple=cfg.min_volume_multiple,fee_rate=cfg.fee_rate,
                 slippage_bps=cfg.slippage_bps,leverage=cfg.default_leverage,
-                risk_per_trade_pct=cfg.risk_per_trade_pct),
-            contract_multiplier=args.contract_multiplier)
+                risk_per_trade_pct=cfg.risk_per_trade_pct,
+                trailing_buffer_pct=cfg.stop_buffer_pct,max_hold_minutes=cfg.max_hold_minutes),
+            contract_multiplier=args.contract_multiplier,lot_size=args.lot_size,
+            min_qty=args.min_qty,tick_size=args.tick_size)
         Path(args.output).parent.mkdir(parents=True,exist_ok=True)
         Path(args.output).write_text(json.dumps(result,indent=2,default=str),encoding="utf-8")
         print(json.dumps(result["metrics"],indent=2));print(f"Detailed report: {args.output}");return 0
