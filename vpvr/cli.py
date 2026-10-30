@@ -1,41 +1,262 @@
-"""Command line entry point for VPVR profile diagnostics and paper-only scans."""
+"""VPVR CLI: diagnostics, signal scan, paper loop and historical backtests.
+
+There is intentionally no live-order command. Paper trading is isolated from
+Delta's private/authenticated trading client.
+"""
 from __future__ import annotations
-import argparse,json
+import argparse
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+import pandas as pd
 from .config import VPVRConfig
-from .data import DeltaMarketData
-from .profile import build_volume_profile
+from .data import DeltaMarketData, MarketDataError
+from .indicators import cumulative_volume_delta
+from .profile import build_volume_profile, rolling_profiles
 from .regime import classify_regime
 from .strategies import generate_signals
 from .risk import RiskEngine
 from .paper import PaperBroker
+from .backtest import run_backtest, BacktestConfig
+
+logger=logging.getLogger("vpvr")
+
+
+def _spread_from_book(book):
+    bids=book.get("buy") or book.get("bids") or []
+    asks=book.get("sell") or book.get("asks") or []
+    def price(level):
+        try:
+            if isinstance(level,dict): return float(level.get("price"))
+            return float(level[0])
+        except (TypeError,ValueError,IndexError,KeyError): return None
+    bid=max((x for x in (price(level) for level in bids) if x is not None),default=None)
+    ask=min((x for x in (price(level) for level in asks) if x is not None),default=None)
+    return bid,ask
+
+
+def _best_quote(data, ticker, symbol):
+    bid=ticker.get("best_bid") or ticker.get("bid")
+    ask=ticker.get("best_ask") or ticker.get("ask")
+    try:
+        bid,ask=float(bid),float(ask)
+    except (TypeError,ValueError):
+        book=data.fetch_orderbook(symbol)
+        bid,ask=_spread_from_book(book)
+    if bid is None or ask is None or bid<=0 or ask<=bid:
+        return None,None,None
+    mid=(bid+ask)/2
+    return bid,ask,(ask-bid)/mid*100
+
+
+def _restore_risk(engine, broker, today):
+    state=broker.state
+    key=today.isoformat()
+    if state.get("risk_day")!=key:
+        state["risk_day"]=key
+        state["risk_day_start_equity"]=broker.balance
+        broker._save()
+    engine.reset_day(float(state["risk_day_start_equity"]),today)
+    closed=sorted(state.get("trades",[]),key=lambda row:row.get("closed_at",""))
+    for trade in closed:
+        engine.consecutive_losses=engine.consecutive_losses+1 if float(trade.get("net_pnl",0))<0 else 0
+    engine.daily_realized_pnl=sum(float(row.get("net_pnl",0)) for row in closed
+                                   if str(row.get("closed_at","")).startswith(key))
+
+
+def _process_new_paper_bars(broker, symbol, candles, funding_rate):
+    last=broker.state.get("last_processed",{}).get(symbol)
+    if last is None:
+        new_rows=candles.tail(1)
+    else:
+        new_rows=candles.loc[candles.time>pd.Timestamp(last)]
+    events=[]
+    for row in new_rows.itertuples(index=False):
+        candle={"time":row.time,"open":row.open,"high":row.high,"low":row.low,
+                "close":row.close,"volume":row.volume}
+        events.extend(broker.process_candle(symbol,candle,funding_rate=funding_rate))
+    return events
+
+
+def scan_once(symbols, paper=False, config=None):
+    cfg=config or VPVRConfig.from_env()
+    data=DeltaMarketData(config=cfg)
+    products={p["symbol"]:p for p in data.fetch_products()}
+    tickers={t.get("symbol"):t for t in data.fetch_tickers() if t.get("symbol")}
+    broker=PaperBroker(path=cfg.paper_state_file,initial_balance=cfg.initial_paper_balance,
+                       fee_rate=cfg.fee_rate,slippage_bps=cfg.slippage_bps)
+    risk=RiskEngine(cfg)
+    today=datetime.now(timezone.utc).date()
+    _restore_risk(risk,broker,today)
+    output=[]
+
+    for symbol in symbols:
+        product=products.get(symbol)
+        if product is None:
+            output.append({"symbol":symbol,"status":"not_a_live_delta_perpetual"})
+            continue
+        try:
+            frames={tf:data.fetch_candles(symbol,tf,300) for tf in ("1m","3m","15m")}
+            freshness={tf:data.freshness(frames[tf],tf) for tf in frames}
+            if not all(ok for ok,_ in freshness.values()):
+                output.append({"symbol":symbol,"status":"no_trade_stale_or_incomplete_data","freshness":freshness})
+                continue
+            ticker=tickers.get(symbol,{})
+            bid,ask,spread=_best_quote(data,ticker,symbol)
+            if spread is None or spread>cfg.max_spread_pct:
+                output.append({"symbol":symbol,"status":"no_trade_spread_unavailable_or_too_wide",
+                               "bid":bid,"ask":ask,"spread_pct":spread,"max_spread_pct":cfg.max_spread_pct})
+                continue
+
+            funding=ticker.get("funding_rate")
+            try: funding=float(funding) if funding is not None else None
+            except (TypeError,ValueError): funding=None
+            # Apply newly closed 1m bars once. On a fresh paper account only the newest
+            # bar is processed to avoid inventing fills before the account was started.
+            paper_events=_process_new_paper_bars(broker,symbol,frames["1m"],funding) if paper else []
+            marks={symbol:float(ticker.get("mark_price") or frames["1m"].close.iloc[-1])}
+            equity=broker.equity(marks)
+            risk.update_equity(equity,today)
+
+            profile_frame=frames["15m"].tail(cfg.profile_lookback_15m)
+            profile=build_volume_profile(profile_frame,rows=cfg.profile_rows,
+                value_area_pct=cfg.value_area_pct,smoothing_window=cfg.node_smoothing_window,
+                node_threshold_pct=cfg.node_threshold_pct)
+            profile_history=rolling_profiles(frames["15m"].tail(96),rows=cfg.profile_rows,
+                value_area_pct=cfg.value_area_pct,window=32,step=16,
+                smoothing_window=cfg.node_smoothing_window,node_threshold_pct=cfg.node_threshold_pct)
+            regime=classify_regime(frames["15m"],frames["3m"],profile,profile_history)
+            signals=generate_signals(symbol,frames["1m"],frames["3m"],frames["15m"],
+                profile,regime,cfg.min_reward_risk,cfg.min_volume_multiple)
+
+            # Aggressor CVD is available only from the REST public trade side field.
+            try:
+                trades=data.fetch_public_trades(symbol)
+                cvd=cumulative_volume_delta(trades)
+            except MarketDataError as exc:
+                cvd={"available":False,"value":None,"reason":str(exc)}
+            specs=data.contract_specs(product)
+            if specs is None:
+                output.append({"symbol":symbol,"status":"contract_metadata_incomplete",
+                    "profile":profile.as_dict(),"regime":regime.regime.value,
+                    "signals":[s.as_dict() for s in signals],"paper_events":paper_events})
+                continue
+
+            signal_rows=[]
+            for signal in signals:
+                if paper and (len(broker.state["positions"])+len(broker.state["pending"]))>=cfg.max_positions:
+                    signal_rows.append({"signal":signal.as_dict(),"status":"max_positions_reached"})
+                    continue
+                decision=risk.size(equity=equity,entry=signal.entry,stop=signal.stop_loss,
+                    direction=signal.direction,leverage=cfg.default_leverage,
+                    contract_multiplier=specs["contract_multiplier"],lot_size=specs["lot_size"],
+                    min_qty=specs["min_qty"],tick_size=specs["tick_size"],
+                    fee_rate=cfg.fee_rate,slippage_bps=cfg.slippage_bps)
+                if not decision.accepted:
+                    signal_rows.append({"signal":signal.as_dict(),"status":"risk_rejected","reason":decision.reason})
+                    continue
+                if paper:
+                    queued,reason=broker.queue_signal(signal,decision.quantity,
+                        contract_multiplier=specs["contract_multiplier"],regime=regime.regime.value)
+                    signal_rows.append({"signal":signal.as_dict(),"status":"paper_trigger_queued" if queued else "paper_rejected",
+                        "reason":reason,"risk":decision.__dict__,"contract_specs_verified":specs["spec_verified"]})
+                else:
+                    signal_rows.append({"signal":signal.as_dict(),"status":"signal_only",
+                        "risk":decision.__dict__,"contract_specs_verified":specs["spec_verified"]})
+
+            output.append({"symbol":symbol,"status":"ok","regime":{"name":regime.regime.value,
+                "confidence":regime.confidence,"reasons":regime.reasons},
+                "profile":profile.as_dict(),"profile_source":profile.source,
+                "spread_pct":spread,"funding_rate":funding,"cvd":cvd,
+                "contract_specs":specs,"paper_events":paper_events,"signals":signal_rows})
+        except (MarketDataError,ValueError,KeyError) as exc:
+            output.append({"symbol":symbol,"status":"data_or_signal_error","reason":str(exc)})
+    return {"mode":"PAPER_ONLY" if paper else "SIGNAL_ONLY","exchange":"Delta Exchange India",
+            "account_balance":broker.balance,"account_equity":broker.equity(),
+            "open_paper_positions":len(broker.state["positions"]),
+            "pending_paper_entries":len(broker.state["pending"]),"results":output}
+
+
+def _load_csv(path):
+    frame=pd.read_csv(path)
+    if "time" not in frame:raise ValueError(f"{path} has no time column")
+    return frame
+
 
 def main(argv=None):
-    p=argparse.ArgumentParser(prog="vpvr",description="VPVR perpetual scalping research and paper engine")
-    sub=p.add_subparsers(dest="command",required=True)
-    sub.add_parser("config",help="print validated configuration")
-    scan=sub.add_parser("scan",help="fetch completed Delta candles and print signals (no live orders)"); scan.add_argument("--symbols",nargs="+",required=True); scan.add_argument("--paper",action="store_true",help="persist candidate paper positions")
-    bt=sub.add_parser("profile",help="build profile from a CSV with time,open,high,low,close,volume"); bt.add_argument("csv")
-    args=p.parse_args(argv); cfg=VPVRConfig.from_env()
-    if args.command=="config": print(json.dumps(cfg.__dict__,indent=2)); return 0
-    if args.command=="profile":
-        import pandas as pd
-        frame=pd.read_csv(args.csv); prof=build_volume_profile(frame,rows=cfg.profile_rows,value_area_pct=cfg.value_area_pct); print(json.dumps(prof.as_dict(),indent=2)); return 0
-    data=DeltaMarketData(config=cfg); products={p["symbol"]:p for p in data.fetch_products()}; tickers={t.get("symbol"):t for t in data.fetch_tickers()}; engine=RiskEngine(cfg); broker=PaperBroker(initial_balance=cfg.initial_paper_balance,fee_rate=cfg.fee_rate,slippage_bps=cfg.slippage_bps)
-    out=[]
-    for symbol in args.symbols:
-        product=products.get(symbol)
-        if not product: out.append({"symbol":symbol,"status":"not a live Delta perpetual"}); continue
-        candles={tf:data.fetch_candles(symbol,tf,300) for tf in ("1m","3m","15m")}; states={tf:data.freshness(candles[tf],tf) for tf in candles}
-        if not all(x[0] for x in states.values()): out.append({"symbol":symbol,"status":"no_trade","data":states}); continue
-        pframe=candles["15m"].tail(96); profile=build_volume_profile(pframe,rows=cfg.profile_rows,value_area_pct=cfg.value_area_pct,node_threshold_pct=cfg.node_threshold_pct,smoothing_window=cfg.node_smoothing_window)
-        regime=classify_regime(candles["15m"],candles["3m"],profile); signals=generate_signals(symbol,candles["1m"],candles["3m"],candles["15m"],profile,regime,cfg.min_reward_risk,cfg.min_volume_multiple)
-        for sig in signals:
-            specs=data.contract_specs(product)
-            if specs is None: out.append({"symbol":symbol,"status":"signal_rejected","reason":"unknown contract specs"}); continue
-            decision=engine.size(equity=broker.state["balance"],entry=sig.entry,stop=sig.stop_loss,direction=sig.direction,leverage=cfg.default_leverage,contract_multiplier=specs["contract_multiplier"],lot_size=specs["lot_size"],min_qty=specs["min_qty"],tick_size=specs["tick_size"],fee_rate=cfg.fee_rate,slippage_bps=cfg.slippage_bps)
-            if not decision.accepted: out.append({"symbol":symbol,"status":"risk_rejected","reason":decision.reason}); continue
-            if args.paper and len(broker.state["positions"])<cfg.max_positions: broker.open_position(sig,decision.quantity); out.append({"symbol":symbol,"status":"paper_opened","signal":sig.as_dict(),"risk":decision.__dict__})
-            else: out.append({"symbol":symbol,"status":"signal_only","signal":sig.as_dict(),"risk":decision.__dict__})
-    print(json.dumps(out,indent=2,default=str)); return 0
+    parser=argparse.ArgumentParser(prog="vpvr",description="Delta VPVR scalping research and paper engine (no live orders)")
+    subs=parser.add_subparsers(dest="command",required=True)
+    subs.add_parser("config",help="print validated configuration")
+    profile=subs.add_parser("profile",help="build a profile from an OHLCV CSV")
+    profile.add_argument("csv")
+    scan=subs.add_parser("scan",help="fetch complete Delta candles and print signals")
+    scan.add_argument("--symbols",nargs="+",required=True)
+    scan.add_argument("--paper",action="store_true",help="queue trigger entries in the isolated paper account")
+    loop=subs.add_parser("paper-loop",help="continuously scan and paper trade; no live orders")
+    loop.add_argument("--symbols",nargs="+",required=True)
+    loop.add_argument("--interval-seconds",type=float,default=15.0)
+    loop.add_argument("--iterations",type=int,default=0,help="0 runs until Ctrl-C")
+    stream=subs.add_parser("stream",help="diagnose Delta public WebSocket market-data feed")
+    stream.add_argument("--symbols",nargs="+",required=True)
+    stream.add_argument("--duration-seconds",type=int,default=0)
+    bt=subs.add_parser("backtest",help="event-driven backtest from three OHLCV CSVs")
+    bt.add_argument("--symbol",required=True)
+    bt.add_argument("--csv-1m",required=True);bt.add_argument("--csv-3m",required=True);bt.add_argument("--csv-15m",required=True)
+    bt.add_argument("--initial-balance",type=float,default=1000)
+    bt.add_argument("--contract-multiplier",type=float,default=1.0)
+    bt.add_argument("--output",default="vpvr_backtest.json")
+    args=parser.parse_args(argv)
+    cfg=VPVRConfig.from_env()
 
-if __name__=="__main__": raise SystemExit(main())
+    if args.command=="config":
+        print(json.dumps(cfg.__dict__,indent=2));return 0
+    if args.command=="profile":
+        frame=_load_csv(args.csv)
+        result=build_volume_profile(frame,rows=cfg.profile_rows,value_area_pct=cfg.value_area_pct,
+            smoothing_window=cfg.node_smoothing_window,node_threshold_pct=cfg.node_threshold_pct)
+        print(json.dumps(result.as_dict(),indent=2));return 0
+    if args.command=="scan":
+        print(json.dumps(scan_once(args.symbols,paper=args.paper,config=cfg),indent=2,default=str));return 0
+    if args.command=="paper-loop":
+        if args.interval_seconds<5:raise ValueError("paper polling interval must be at least five seconds")
+        count=0
+        try:
+            while not args.iterations or count<args.iterations:
+                result=scan_once(args.symbols,paper=True,config=cfg)
+                print(json.dumps(result,default=str),flush=True)
+                count+=1
+                if args.iterations and count>=args.iterations:break
+                time.sleep(args.interval_seconds)
+        except KeyboardInterrupt:
+            print("\nPaper loop stopped; virtual positions and pending entries remain persisted.",flush=True)
+        return 0
+    if args.command=="stream":
+        from .stream import DeltaPublicStream
+        stream=DeltaPublicStream(args.symbols);stream.start()
+        started=time.time()
+        try:
+            while not args.duration_seconds or time.time()-started<args.duration_seconds:
+                print(json.dumps(stream.status()),flush=True);time.sleep(5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stream.close()
+        return 0
+    if args.command=="backtest":
+        result=run_backtest(args.symbol,_load_csv(args.csv_1m),_load_csv(args.csv_3m),_load_csv(args.csv_15m),
+            BacktestConfig(initial_balance=args.initial_balance,profile_rows=cfg.profile_rows,
+                value_area_pct=cfg.value_area_pct,min_reward_risk=cfg.min_reward_risk,
+                volume_multiple=cfg.min_volume_multiple,fee_rate=cfg.fee_rate,
+                slippage_bps=cfg.slippage_bps,leverage=cfg.default_leverage,
+                risk_per_trade_pct=cfg.risk_per_trade_pct),
+            contract_multiplier=args.contract_multiplier)
+        Path(args.output).parent.mkdir(parents=True,exist_ok=True)
+        Path(args.output).write_text(json.dumps(result,indent=2,default=str),encoding="utf-8")
+        print(json.dumps(result["metrics"],indent=2));print(f"Detailed report: {args.output}");return 0
+    return 2
+
+if __name__=="__main__":
+    logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+    raise SystemExit(main())
