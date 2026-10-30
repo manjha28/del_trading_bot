@@ -130,6 +130,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
             else:
                 targets=pos["targets"]
                 fractions=[1.0] if len(targets)==1 else ([.30,.45] if len(targets)==2 else [.30,.45,.25])
+                closed_in_bar=False
                 while pos["target_index"]<len(targets):
                     ix=pos["target_index"];target=targets[ix]
                     hit=bar["high"]>=target if direction=="LONG" else bar["low"]<=target
@@ -141,26 +142,40 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                     pos["remaining"]-=qty;equity+=net;pos["target_index"]+=1
                     if ix==0:pos["stop"]=pos["entry"]
                     elif ix==1:pos["stop"]=targets[0]
+                    stop_after_target=bar["low"]<=pos["stop"] if direction=="LONG" else bar["high"]>=pos["stop"]
+                    if pos["remaining"]>1e-10 and stop_after_target:
+                        fill=pos["stop"]*(1-cfg.slippage_bps/10000 if direction=="LONG" else 1+cfg.slippage_bps/10000)
+                        remaining=pos["remaining"]
+                        gross_exit=((fill-pos["entry"]) if direction=="LONG" else (pos["entry"]-fill))*remaining*contract_multiplier
+                        fee_exit=abs(fill*remaining*contract_multiplier)*cfg.fee_rate
+                        pos["gross_pnl"]+=gross_exit;pos["fees"]+=fee_exit
+                        pos["net_pnl"]+=gross_exit-fee_exit;equity+=gross_exit-fee_exit
+                        trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":fill,
+                            "exit_reason":"SAME_BAR_TIGHTENED_STOP",
+                            "holding_minutes":(ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60})
+                        consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
+                        equity_curve.append(equity);position=None;closed_in_bar=True
+                        break
                     if pos["remaining"]<=1e-10:break
-                if pos["remaining"]<=1e-10:
-                    trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":targets[-1],"exit_reason":"TARGETS",
-                        "holding_minutes":(ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60})
-                    consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
-                    equity_curve.append(equity);position=None
-                elif (ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60>=cfg.max_hold_minutes:
-                    fill=bar["close"]*(1-cfg.slippage_bps/10000 if direction=="LONG" else 1+cfg.slippage_bps/10000)
-                    qty=pos["remaining"]
-                    gross=((fill-pos["entry"]) if direction=="LONG" else (pos["entry"]-fill))*qty*contract_multiplier
-                    fee=abs(fill*qty*contract_multiplier)*cfg.fee_rate
-                    pos["gross_pnl"]+=gross;pos["fees"]+=fee;pos["net_pnl"]+=gross-fee;equity+=gross-fee
-                    trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":fill,"exit_reason":"TIMEOUT",
-                        "holding_minutes":cfg.max_hold_minutes})
-                    consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
-                    equity_curve.append(equity);position=None
-                if position is pos:
-                    pos["last_candle_low"]=bar["low"]
-                    pos["last_candle_high"]=bar["high"]
-
+                if not closed_in_bar:
+                    if pos["remaining"]<=1e-10:
+                        trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":targets[-1],"exit_reason":"TARGETS",
+                            "holding_minutes":(ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60})
+                        consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
+                        equity_curve.append(equity);position=None
+                    elif (ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60>=cfg.max_hold_minutes:
+                        fill=bar["close"]*(1-cfg.slippage_bps/10000 if direction=="LONG" else 1+cfg.slippage_bps/10000)
+                        qty=pos["remaining"]
+                        gross=((fill-pos["entry"]) if direction=="LONG" else (pos["entry"]-fill))*qty*contract_multiplier
+                        fee=abs(fill*qty*contract_multiplier)*cfg.fee_rate
+                        pos["gross_pnl"]+=gross;pos["fees"]+=fee;pos["net_pnl"]+=gross-fee;equity+=gross-fee
+                        trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":fill,"exit_reason":"TIMEOUT",
+                            "holding_minutes":cfg.max_hold_minutes})
+                        consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
+                        equity_curve.append(equity);position=None
+                    if position is pos:
+                        pos["last_candle_low"]=bar["low"]
+                        pos["last_candle_high"]=bar["high"]
         # Process an older queued trigger on this candle only.
         if pending and position is None:
             sig=pending["signal"];pending["bars_waited"]+=1;direction=sig.direction
