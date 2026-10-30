@@ -196,7 +196,7 @@ class StoreTests(unittest.TestCase):
             rows = store.outcome_records()
             one_hour = next(row for row in rows if row["horizon_hours"] == 1)
             self.assertEqual(len([row for row in rows if row["horizon_hours"] == 1]), 1)
-            self.assertAlmostEqual(one_hour["gross_return_pct"], (100 / 90 - 1) * 100)
+            self.assertAlmostEqual(one_hour["gross_return_pct"], 10.0)
             self.assertAlmostEqual(one_hour["estimated_cost_pct"], 0.3)
             self.assertAlmostEqual(one_hour["net_return_pct"], one_hour["gross_return_pct"] - 0.3)
             dashboard = build_dashboard(
@@ -209,7 +209,7 @@ class StoreTests(unittest.TestCase):
 
 
 class DiscoveryTests(unittest.TestCase):
-    def test_product_loader_keeps_every_perpetual_state_without_symbol_filters(self):
+    def test_product_loader_uses_cursor_pagination_and_keeps_all_perpetual_states(self):
         data = DeltaResearchData(request_interval=0)
         first_page = [
             {"id": index, "symbol": f"SYM{index}", "contract_type": "perpetual_futures",
@@ -219,13 +219,19 @@ class DiscoveryTests(unittest.TestCase):
         second_page = [{"id": 1001, "symbol": "NEWUSD",
                         "contract_type": "perpetual_futures", "state": "live"}]
         with patch.object(data, "_get", side_effect=[
-            {"result": first_page}, {"result": second_page},
+            {"result": first_page, "meta": {"after": "next-page"}},
+            {"result": second_page, "meta": {"after": None}},
         ]) as get:
             products = data.fetch_products()
         self.assertEqual(len(products), 1001)
         self.assertEqual(products[-2]["state"], "expired")
         self.assertEqual(get.call_count, 2)
-        self.assertEqual(get.call_args_list[0].args[1], {"page": 1, "page_size": 1000})
+        first_params = get.call_args_list[0].args[1]
+        self.assertEqual(first_params["contract_types"], "perpetual_futures")
+        self.assertEqual(first_params["states"], "upcoming,live,expired,settled")
+        self.assertEqual(first_params["page_size"], 1000)
+        self.assertNotIn("page", first_params)
+        self.assertEqual(get.call_args_list[1].args[1]["after"], "next-page")
         data.close()
 
     def test_scan_records_live_and_inactive_catalog_without_order_execution(self):
