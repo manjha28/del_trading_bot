@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import math
+import statistics
 from typing import Mapping, Sequence
 
 from .market_data import Candle, Instrument
@@ -16,14 +17,26 @@ class PortfolioSimulationConfig:
     max_portfolio_risk_pct: float = 0.015
     max_gross_leverage: float = 2.0
     trade: PaperSimulationConfig = PaperSimulationConfig()
+    max_pairwise_correlation: float = 0.8
+    correlation_lookback_minutes: int = 60
+    minimum_correlation_observations: int = 30
 
     def __post_init__(self) -> None:
         if self.max_open_positions < 1:
             raise ValueError("max_open_positions must be positive")
-        for name in ("max_portfolio_risk_pct", "max_gross_leverage"):
+        for name in (
+            "max_portfolio_risk_pct", "max_gross_leverage",
+            "max_pairwise_correlation",
+        ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive and finite")
+        if self.max_pairwise_correlation >= 1:
+            raise ValueError("max_pairwise_correlation must be less than 1")
+        if self.correlation_lookback_minutes < 2:
+            raise ValueError("correlation_lookback_minutes must be at least 2")
+        if self.minimum_correlation_observations < 3:
+            raise ValueError("minimum_correlation_observations must be at least 3")
         if self.max_portfolio_risk_pct > 0.02:
             raise ValueError("max_portfolio_risk_pct cannot exceed 2%")
         if self.max_gross_leverage > 20:
@@ -150,9 +163,13 @@ class PortfolioPaperSimulator:
                 rejection = "same-product position already open"
             elif len(active) >= self.config.max_open_positions:
                 rejection = "maximum open positions reached"
-            elif open_notional + notional > equity * self.config.max_gross_leverage:
+            else:
+                rejection = self._correlation_rejection(
+                    signal, decision, active, candles_by_product
+                )
+            if rejection is None and open_notional + notional > equity * self.config.max_gross_leverage:
                 rejection = "maximum gross portfolio exposure exceeded"
-            elif open_risk + risk > equity * self.config.max_portfolio_risk_pct:
+            elif rejection is None and open_risk + risk > equity * self.config.max_portfolio_risk_pct:
                 rejection = "maximum portfolio stop-risk exceeded"
             if rejection:
                 outcomes.append(self._reject(signal, equity, rejection))
@@ -186,14 +203,77 @@ class PortfolioPaperSimulator:
                 "max_open_positions": self.config.max_open_positions,
                 "max_portfolio_risk_pct": self.config.max_portfolio_risk_pct,
                 "max_gross_leverage": self.config.max_gross_leverage,
+                "max_pairwise_correlation": self.config.max_pairwise_correlation,
+                "correlation_lookback_minutes": self.config.correlation_lookback_minutes,
                 "per_trade_risk_pct": self.trade_config.risk_per_trade_pct,
             },
             limitations=(
                 "Positions are filled with the single-trade OHLCV simulator; partial fills and market impact are absent.",
-                "Funding cash flows, maintenance margin, liquidation, and correlation stress are not modeled.",
+                "Funding cash flows, maintenance margin, liquidation, and correlation stress outside the recent aligned-return gate are not modeled.",
                 "Signals are processed chronologically and overlapping same-product positions are rejected.",
             ),
         )
+
+    def _correlation_rejection(
+        self,
+        signal: StrategySignal,
+        decision: datetime,
+        active: list[tuple[PaperTradeResult, float, float]],
+        candles_by_product: Mapping[str, Sequence[Candle]],
+    ) -> str | None:
+        for open_trade, _, _ in active:
+            if open_trade.direction != signal.direction:
+                continue
+            returns = self._aligned_returns(
+                candles_by_product.get(signal.product_id, ()),
+                candles_by_product.get(open_trade.product_id, ()),
+                decision,
+            )
+            if len(returns) < self.config.minimum_correlation_observations:
+                return "insufficient aligned history to estimate exposure correlation"
+            new_returns, open_returns = zip(*returns)
+            if statistics.pstdev(new_returns) == 0 or statistics.pstdev(open_returns) == 0:
+                return "undefined return correlation; correlated exposure rejected"
+            correlation = statistics.correlation(new_returns, open_returns)
+            if not math.isfinite(correlation):
+                return "non-finite return correlation; correlated exposure rejected"
+            if correlation >= self.config.max_pairwise_correlation:
+                return (
+                    "same-direction correlated exposure exceeded "
+                    f"{self.config.max_pairwise_correlation:.2f}"
+                )
+        return None
+
+    def _aligned_returns(
+        self,
+        left: Sequence[Candle],
+        right: Sequence[Candle],
+        decision: datetime,
+    ) -> list[tuple[float, float]]:
+        cutoff = decision.astimezone(timezone.utc)
+        lookback = cutoff - timedelta(minutes=self.config.correlation_lookback_minutes)
+
+        def series(candles: Sequence[Candle]) -> dict[datetime, float]:
+            ordered = sorted(
+                (
+                    candle for candle in candles
+                    if candle.is_complete
+                    and lookback <= candle.start_time < cutoff
+                ),
+                key=lambda candle: candle.start_time,
+            )
+            return {
+                current.start_time: current.close / prior.close - 1
+                for prior, current in zip(ordered, ordered[1:])
+                if prior.close > 0
+            }
+
+        left_returns = series(left)
+        right_returns = series(right)
+        return [
+            (left_returns[stamp], right_returns[stamp])
+            for stamp in sorted(left_returns.keys() & right_returns.keys())
+        ]
 
     @staticmethod
     def _reject(signal: StrategySignal, equity: float, reason: str) -> PaperTradeResult:

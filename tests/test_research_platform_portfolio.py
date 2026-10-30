@@ -56,18 +56,49 @@ def bars(product_id, symbol, target=120):
     ]
 
 
+def correlation_bars(product_id, symbol, return_pattern, exit_index=16):
+    closes = [100.0]
+    for value in return_pattern:
+        closes.append(closes[-1] * (1 + value / 10_000))
+    closes.extend([closes[-1]] * (exit_index + 1 - len(closes)))
+    result = []
+    for index, close in enumerate(closes):
+        high = max(101.0, close + 0.1)
+        if index == exit_index:
+            high = 121
+        result.append(Candle(
+            product_id, symbol, "1m", T0 + timedelta(minutes=index),
+            100, high, min(99.0, close - 0.1), close, 10, "fixture", True,
+        ))
+    return result
+
+
 class PortfolioSimulationTests(unittest.TestCase):
     def test_multiple_independent_products_fit_configured_open_slots(self):
-        config = PortfolioSimulationConfig(max_open_positions=2)
+        config = PortfolioSimulationConfig(
+            max_open_positions=2,
+            correlation_lookback_minutes=10,
+            minimum_correlation_observations=5,
+        )
         simulator = PortfolioPaperSimulator(config)
         instruments = {
             "1": product("1", "AAAUSD"),
             "2": product("2", "BBBUSD"),
         }
         result = simulator.simulate(
-            [signal("1", "AAAUSD"), signal("2", "BBBUSD")],
+            [
+                signal("1", "AAAUSD", T0 + timedelta(minutes=10)),
+                signal("2", "BBBUSD", T0 + timedelta(minutes=10)),
+            ],
             instruments,
-            {"1": bars("1", "AAAUSD"), "2": bars("2", "BBBUSD")},
+            {
+                "1": correlation_bars(
+                    "1", "AAAUSD", [1, -1] * 5
+                ),
+                "2": correlation_bars(
+                    "2", "BBBUSD", [-1, 1] * 5
+                ),
+            },
             10_000,
         )
         self.assertEqual(result.status, "simulated")
@@ -75,6 +106,31 @@ class PortfolioSimulationTests(unittest.TestCase):
         self.assertEqual(result.max_concurrent_positions, 2)
         self.assertAlmostEqual(result.final_equity, 10_000 + result.net_pnl)
         self.assertEqual(result.rejected_count, 0)
+
+    def test_high_same_direction_return_correlation_rejects_second_position(self):
+        config = PortfolioSimulationConfig(
+            max_open_positions=2,
+            correlation_lookback_minutes=10,
+            minimum_correlation_observations=5,
+        )
+        result = PortfolioPaperSimulator(config).simulate(
+            [
+                signal("1", "AAAUSD", T0 + timedelta(minutes=10)),
+                signal("2", "BBBUSD", T0 + timedelta(minutes=11)),
+            ],
+            {
+                "1": product("1", "AAAUSD"),
+                "2": product("2", "BBBUSD"),
+            },
+            {
+                "1": correlation_bars("1", "AAAUSD", [1, -1] * 5),
+                "2": correlation_bars("2", "BBBUSD", [1, -1] * 5),
+            },
+            10_000,
+        )
+        self.assertEqual(result.accepted_count, 1)
+        rejected = next(item for item in result.outcomes if item.status == "rejected")
+        self.assertIn("correlated exposure", rejected.reason)
 
     def test_open_slot_and_same_product_overlap_are_rejected(self):
         simulator = PortfolioPaperSimulator(

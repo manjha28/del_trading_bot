@@ -547,15 +547,21 @@ class ResearchDataStore:
                 _json(split), _json(config), _json(metrics or {}), status,
             ))
 
-    def list_experiments(self, limit: int = 100, offset: int = 0) -> dict:
+    def list_experiments(
+        self, limit: int = 100, offset: int = 0, strategy_id: str | None = None
+    ) -> dict:
         if limit < 1 or offset < 0:
             raise ValueError("limit must be positive and offset non-negative")
-        total = self.connection.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
-        rows = self.connection.execute("""
+        where = " WHERE strategy_id=?" if strategy_id else ""
+        params = (strategy_id,) if strategy_id else ()
+        total = self.connection.execute(
+            f"SELECT COUNT(*) FROM experiments{where}", params
+        ).fetchone()[0]
+        rows = self.connection.execute(f"""
             SELECT experiment_id,strategy_id,strategy_version,dataset_version,
                    created_at,split_json,config_json,metrics_json,status
-            FROM experiments ORDER BY created_at DESC,experiment_id LIMIT ? OFFSET ?
-        """, (limit, offset)).fetchall()
+            FROM experiments{where} ORDER BY created_at DESC,experiment_id LIMIT ? OFFSET ?
+        """, (*params, limit, offset)).fetchall()
         return {
             "items": [
                 dict(row) | {

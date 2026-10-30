@@ -94,6 +94,10 @@ class ResearchPlatformServerTests(unittest.TestCase):
             "mhr_scalp_fast_slow_normalized_exit_adapters",
             capabilities["available_research_tools"],
         )
+        self.assertIn(
+            "validation_only_regime_aware_strategy_selection",
+            capabilities["available_research_tools"],
+        )
 
         with ResearchDataStore(self.db_path, read_only=True) as store:
             self.assertEqual(store.coverage_summary()["candle_count"], 1)
@@ -128,15 +132,22 @@ class ResearchPlatformServerTests(unittest.TestCase):
                 datetime(2026, 1, 2, tzinfo=UTC), "no_signal",
                 "fixture evaluation",
             )
+            store.save_experiment(
+                "selector-1", "validated_strategy_selector", "v1", "dataset-1",
+                {"fold": 0}, {"mode": "paper_only"},
+                {"selection": {"no_trade": True, "selected_count": 0}},
+                created_at=datetime(2026, 1, 3, tzinfo=UTC),
+            )
 
         _, summary = self.get("/api/summary")
-        self.assertEqual(summary["experiment_count"], 1)
+        self.assertEqual(summary["experiment_count"], 2)
         self.assertEqual(summary["paper_simulation_count"], 1)
         self.assertEqual(summary["variant_evaluation_count"], 1)
 
         _, experiments = self.get("/api/experiments")
-        self.assertEqual(experiments["total"], 1)
-        self.assertEqual(experiments["items"][0]["metrics"]["net_pnl"], 12.5)
+        self.assertEqual(experiments["total"], 2)
+        legacy = next(item for item in experiments["items"] if item["experiment_id"] == "exp-1")
+        self.assertEqual(legacy["metrics"]["net_pnl"], 12.5)
 
         _, simulations = self.get("/api/simulations?symbol=TESTUSD")
         self.assertEqual(simulations["total"], 1)
@@ -145,6 +156,11 @@ class ResearchPlatformServerTests(unittest.TestCase):
         _, evaluations = self.get("/api/variant-evaluations?variant_id=failed_high_vwap_retest")
         self.assertEqual(evaluations["total"], 1)
         self.assertEqual(evaluations["items"][0]["status"], "no_signal")
+        _, selector = self.get("/api/selector")
+        self.assertEqual(selector["total"], 1)
+        self.assertTrue(selector["items"][0]["metrics"]["selection"]["no_trade"])
+        _, filtered = self.get("/api/experiments?strategy_id=validated_strategy_selector")
+        self.assertEqual(filtered["total"], 1)
 
     def test_api_exposes_variant_gates_and_aggregates_existing_sources_read_only(self):
         _, variants = self.get("/api/variants")

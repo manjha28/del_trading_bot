@@ -51,6 +51,14 @@ from .exit_adapters import (
 )
 from .variants import ResearchVariant, ResearchVariantContext, ResearchVariantSuite
 from .portfolio import PortfolioPaperSimulator, PortfolioSimulationConfig, PortfolioSimulationResult
+from .selection import (
+    StrategySelectionPolicy,
+    StrategySelectionResult,
+    ValidatedStrategySelector,
+    ValidationEvidence,
+    build_validation_evidence,
+    classify_market_regime,
+)
 
 __all__ = [
     "BookLevel",
@@ -72,6 +80,12 @@ __all__ = [
     "PortfolioPaperSimulator",
     "PortfolioSimulationConfig",
     "PortfolioSimulationResult",
+    "StrategySelectionPolicy",
+    "StrategySelectionResult",
+    "ValidatedStrategySelector",
+    "ValidationEvidence",
+    "build_validation_evidence",
+    "classify_market_regime",
     "PaperSimulationConfig",
     "PaperSimulator",
     "PaperTradeResult",

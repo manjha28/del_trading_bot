@@ -272,6 +272,9 @@ def _backtest(args) -> int:
                 max_open_positions=args.max_open_positions,
                 max_portfolio_risk_pct=args.max_portfolio_risk_pct,
                 max_gross_leverage=args.max_gross_leverage,
+                max_pairwise_correlation=args.max_pairwise_correlation,
+                correlation_lookback_minutes=args.correlation_lookback_minutes,
+                minimum_correlation_observations=args.minimum_correlation_observations,
                 trade=PaperSimulationConfig(
                     risk_per_trade_pct=args.trade_risk_pct,
                     leverage=max(1.0, args.max_gross_leverage),
@@ -315,6 +318,9 @@ def _backtest(args) -> int:
                         "max_open_positions": args.max_open_positions,
                         "max_portfolio_risk_pct": args.max_portfolio_risk_pct,
                         "max_gross_leverage": args.max_gross_leverage,
+                        "max_pairwise_correlation": args.max_pairwise_correlation,
+                        "correlation_lookback_minutes": args.correlation_lookback_minutes,
+                        "minimum_correlation_observations": args.minimum_correlation_observations,
                         "fee_rate": args.fee_rate,
                         "spread_bps": args.spread_bps,
                         "slippage_bps": args.slippage_bps,
@@ -325,6 +331,44 @@ def _backtest(args) -> int:
                 )
                 for outcome in outcomes:
                     store.save_paper_simulation(outcome, experiment_id)
+        for fold in report["selector"]["folds"]:
+            outcomes = fold.pop("_outcomes", [])
+            experiment_id = f"wf-{run_tag}-validated-selector-{fold['fold']:03d}"
+            store.save_experiment(
+                experiment_id,
+                "validated_strategy_selector",
+                "validated-selector-v1",
+                dataset_version,
+                {
+                    "train_end": fold["train_end"],
+                    "validation_end": fold["validation_end"],
+                    "out_of_sample_start": fold["out_of_sample_start"],
+                    "out_of_sample_end": fold["out_of_sample_end"],
+                    "fold": fold["fold"],
+                },
+                {
+                    "mode": "paper_only_walk_forward_selector",
+                    "initial_equity": args.initial_equity,
+                    "selector_policy": report["selector"]["policy"],
+                    "portfolio": {
+                        "max_open_positions": args.max_open_positions,
+                        "max_portfolio_risk_pct": args.max_portfolio_risk_pct,
+                        "max_gross_leverage": args.max_gross_leverage,
+                        "max_pairwise_correlation": args.max_pairwise_correlation,
+                        "correlation_lookback_minutes": args.correlation_lookback_minutes,
+                        "minimum_correlation_observations": args.minimum_correlation_observations,
+                    },
+                },
+                {
+                    "selection": fold["selection"],
+                    "portfolio": fold["portfolio"],
+                    "summary": fold["metrics"],
+                    "limitations": report["limitations"],
+                },
+                status="completed",
+            )
+            for outcome in outcomes:
+                store.save_paper_simulation(outcome, experiment_id)
         report["dataset_version"] = dataset_version
         report["fold_count"] = len(folds)
         report["instrument_count"] = len(instruments)
@@ -372,6 +416,9 @@ def main(argv=None) -> int:
     backtest.add_argument("--max-open-positions", type=int, default=3)
     backtest.add_argument("--max-portfolio-risk-pct", type=float, default=0.015)
     backtest.add_argument("--max-gross-leverage", type=float, default=2.0)
+    backtest.add_argument("--max-pairwise-correlation", type=float, default=0.8)
+    backtest.add_argument("--correlation-lookback-minutes", type=int, default=60)
+    backtest.add_argument("--minimum-correlation-observations", type=int, default=30)
     backtest.add_argument("--trade-risk-pct", type=float, default=0.005)
     backtest.add_argument("--fee-rate", type=float, default=0.0005)
     backtest.add_argument("--spread-bps", type=float, default=5.0)

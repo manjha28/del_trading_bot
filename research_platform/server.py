@@ -201,6 +201,8 @@ def create_handler(
                                 "capability_gated_walk_forward_variant_evaluation",
                                 "paper_only_walk_forward_backtest_cli",
                                 "trade_outcome_persistence",
+                                "validation_only_regime_aware_strategy_selection",
+                                "same_direction_recent_return_correlation_gate",
                             ],
                             "exit_adapter_limitations": [
                                 "legacy exit simulations do not apply fees or execution costs",
@@ -208,7 +210,8 @@ def create_handler(
                             ],
                             "paper_simulator_limitations": [
                                 "portfolio mode caps concurrent positions but uses independent OHLCV trade simulations",
-                                "no partial fills, market impact, funding cash flows, maintenance margin, liquidation, or correlation stress",
+                                "no partial fills, market impact, funding cash flows, maintenance margin, liquidation, or portfolio correlation stress scenarios",
+                                "same-direction positions are gated by recent aligned 1m return correlation; insufficient or undefined estimates fail closed",
                                 "unverified contract specifications rejected",
                                 "OHLCV ambiguity resolved stop-first",
                             ],
@@ -233,6 +236,13 @@ def create_handler(
                         result = store.list_experiments(
                             _integer(params, "limit", 100, MAX_LIMIT),
                             _integer(params, "offset", 0, 10_000_000),
+                            params.get("strategy_id", [None])[0],
+                        )
+                    elif path == "/api/selector":
+                        result = store.list_experiments(
+                            _integer(params, "limit", 100, MAX_LIMIT),
+                            _integer(params, "offset", 0, 10_000_000),
+                            "validated_strategy_selector",
                         )
                     elif path == "/api/simulations":
                         result = store.list_paper_simulations(

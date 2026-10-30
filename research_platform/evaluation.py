@@ -8,6 +8,12 @@ import pandas as pd
 
 from .market_data import Instrument, TIMEFRAME_SECONDS
 from .portfolio import PortfolioPaperSimulator, PortfolioSimulationConfig
+from .selection import (
+    ValidatedStrategySelector,
+    build_validation_evidence,
+    classify_market_regime,
+    signal_key,
+)
 from .strategies import StrategyContext
 from .validation import ChronologicalPeriods, deflated_sharpe_ratio, summarize_paper_results
 from .variants import ResearchVariantSuite, ResearchVariantContext
@@ -116,6 +122,11 @@ def evaluate_walk_forward_variants(
         raise ValueError("walk-forward evaluation requires the discovered instrument universe")
     outcomes = {}
     simulator = PortfolioPaperSimulator(portfolio_config)
+    all_candles_1m = {
+        product_id: _canonical_candles(frames.get("1m"), instruments_by_id[product_id])
+        for product_id, frames in frames_by_product.items()
+        if product_id in all_product_ids and frames.get("1m") is not None
+    }
     for variant_id, variant_signals in signals.items():
         fold_results = []
         oos_signal_products: set[str] = set()
@@ -127,9 +138,11 @@ def evaluate_walk_forward_variants(
             ]
             oos_signal_products.update(signal.product_id for signal in candidates)
             candles_1m = {
-                product_id: _canonical_candles(frames.get("1m"), instruments_by_id[product_id])
-                for product_id, frames in frames_by_product.items()
-                if product_id in all_product_ids and frames.get("1m") is not None
+                product_id: [
+                    candle for candle in candles
+                    if candle.start_time < fold.out_of_sample_end
+                ]
+                for product_id, candles in all_candles_1m.items()
             }
             portfolio = simulator.simulate(
                 candidates,
@@ -211,17 +224,130 @@ def evaluate_walk_forward_variants(
             "symbols_without_signal_or_data": len(instruments) - len(oos_signal_products),
             "folds": fold_results,
         }
+
+    selector = ValidatedStrategySelector()
+    selection_folds = []
+    for fold_index, fold in enumerate(folds):
+        validation_start = fold.train_end + fold.embargo
+        validation_candidates = [
+            signal
+            for variant_signals in signals.values()
+            for signal in variant_signals
+            if validation_start <= signal.decision_time <= fold.validation_end
+        ]
+        validation_regimes = {
+            signal_key(signal): _regime_at(
+                signal, frames_by_product.get(signal.product_id, {})
+            )
+            for signal in validation_candidates
+        }
+        validation_outcomes = []
+        validation_candles = {
+            product_id: [
+                candle for candle in candles
+                if candle.start_time < fold.validation_end
+            ]
+            for product_id, candles in all_candles_1m.items()
+        }
+        for variant_id, variant_signals in signals.items():
+            candidates = [
+                signal for signal in variant_signals
+                if validation_start <= signal.decision_time <= fold.validation_end
+            ]
+            if candidates:
+                validation_portfolio = simulator.simulate(
+                    candidates,
+                    instruments_by_id,
+                    validation_candles,
+                    initial_equity,
+                )
+                validation_outcomes.extend(validation_portfolio.outcomes)
+        evidence = build_validation_evidence(
+            validation_outcomes, validation_regimes, fold.validation_end
+        )
+        test_start = fold.validation_end + fold.embargo
+        oos_candidates = [
+            signal
+            for variant_signals in signals.values()
+            for signal in variant_signals
+            if test_start <= signal.decision_time <= fold.out_of_sample_end
+        ]
+        oos_regimes = {
+            signal_key(signal): _regime_at(
+                signal, frames_by_product.get(signal.product_id, {})
+            )
+            for signal in oos_candidates
+        }
+        selection = selector.select(oos_candidates, evidence, oos_regimes)
+        oos_candles = {
+            product_id: [
+                candle for candle in candles
+                if candle.start_time < fold.out_of_sample_end
+            ]
+            for product_id, candles in all_candles_1m.items()
+        }
+        selected_portfolio = simulator.simulate(
+            selection.selected,
+            instruments_by_id,
+            oos_candles,
+            initial_equity,
+        )
+        selection_folds.append({
+            "fold": fold_index,
+            "train_end": fold.train_end.isoformat(),
+            "validation_end": fold.validation_end.isoformat(),
+            "out_of_sample_start": test_start.isoformat(),
+            "out_of_sample_end": fold.out_of_sample_end.isoformat(),
+            "validation_candidate_count": len(validation_candidates),
+            "validation_simulated_count": sum(
+                item.status == "simulated" for item in validation_outcomes
+            ),
+            "selection": selection.as_record(),
+            "portfolio": {
+                "status": selected_portfolio.status,
+                "initial_equity": selected_portfolio.initial_equity,
+                "final_equity": selected_portfolio.final_equity,
+                "net_pnl": selected_portfolio.net_pnl,
+                "max_drawdown_pct": selected_portfolio.realized_max_drawdown_pct,
+                "accepted_count": selected_portfolio.accepted_count,
+                "rejected_count": selected_portfolio.rejected_count,
+                "max_concurrent_positions": selected_portfolio.max_concurrent_positions,
+                "constraints": selected_portfolio.constraints,
+            },
+            "metrics": summarize_paper_results(selected_portfolio.outcomes),
+            "_outcomes": [asdict(item) for item in selected_portfolio.outcomes],
+        })
     return {
         "status": "research_only",
         "variants": outcomes,
+        "selector": {
+            "status": "research_only",
+            "policy": {
+                "minimum_validation_trades": selector.policy.minimum_validation_trades,
+                "minimum_net_expectancy": selector.policy.minimum_net_expectancy,
+                "overlap_window_seconds": selector.policy.overlap_window.total_seconds(),
+            },
+            "folds": selection_folds,
+        },
         "coverage": data_status,
         "limitations": [
-            "Fold metrics are OOS only for the provided split boundaries; no model fitting or strategy selection occurs inside folds.",
+            "Standalone fold metrics are OOS; the combined selector is fitted only from simulated validation-period net outcomes and must not be tuned using its OOS folds.",
             "OHLCV fills use the constrained paper simulator; depth/impact, funding, liquidation, and correlation stress are not modeled.",
-            "Portfolio risk is bounded by open slots, notional, and stop risk; correlation between contracts is not estimated.",
+            "Strategy selection uses only simulated validation outcomes grouped by per-symbol OHLCV regime; minimum samples and positive net expectancy are required, otherwise it selects no trade.",
+            "Portfolio risk is bounded by open slots, notional, stop risk, same-product overlap, and a recent aligned-return correlation gate; the gate is not a full correlation stress model.",
             "Unavailable or insufficient-data symbols remain in the coverage matrix and are not counted as losing trades.",
         ],
     }
+
+
+def _regime_at(
+    signal,
+    frames: Mapping[str, pd.DataFrame],
+) -> str | None:
+    hourly = frames.get("1h")
+    if hourly is None or hourly.empty:
+        return None
+    return classify_market_regime(hourly, signal.decision_time)
 
 
 def _fold_coverage_state(

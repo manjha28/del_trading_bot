@@ -183,6 +183,24 @@ class ResearchPlatformCLITests(unittest.TestCase):
                         }],
                     }
                 },
+                "selector": {
+                    "policy": {
+                        "minimum_validation_trades": 3,
+                        "minimum_net_expectancy": 0.0,
+                        "overlap_window_seconds": 300.0,
+                    },
+                    "folds": [{
+                        "fold": 0,
+                        "train_end": (start + timedelta(days=1)).isoformat(),
+                        "validation_end": (start + timedelta(days=2)).isoformat(),
+                        "out_of_sample_start": (start + timedelta(days=2)).isoformat(),
+                        "out_of_sample_end": (start + timedelta(days=3)).isoformat(),
+                        "selection": {"selected_count": 1, "no_trade": False},
+                        "portfolio": {"net_pnl": 5.0},
+                        "metrics": {"net_pnl": 5.0},
+                        "_outcomes": [outcome],
+                    }],
+                },
             }
             output = io.StringIO()
             with patch(
@@ -202,10 +220,10 @@ class ResearchPlatformCLITests(unittest.TestCase):
             with ResearchDataStore(db_path, read_only=True) as store:
                 experiments = store.list_experiments()
                 simulations = store.list_paper_simulations()
-            self.assertEqual(experiments["total"], 1)
-            self.assertEqual(experiments["items"][0]["status"], "completed")
-            self.assertEqual(simulations["total"], 1)
-            self.assertEqual(simulations["items"][0]["result"]["net_pnl"], 5.0)
+            self.assertEqual(experiments["total"], 2)
+            self.assertTrue(all(item["status"] == "completed" for item in experiments["items"]))
+            self.assertEqual(simulations["total"], 2)
+            self.assertTrue(all(item["result"]["net_pnl"] == 5.0 for item in simulations["items"]))
 
 
 if __name__ == "__main__":

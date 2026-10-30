@@ -84,6 +84,7 @@ class WalkForwardEvaluationTests(unittest.TestCase):
         self.assertEqual(
             report["variants"]["liquidity_sweep_reclaim"]["symbols_with_signal"], 1
         )
+        self.assertTrue(report["selector"]["folds"][0]["selection"]["no_trade"])
         self.assertEqual(report["status"], "research_only")
         self.assertIn("correlation", " ".join(report["limitations"]))
 
