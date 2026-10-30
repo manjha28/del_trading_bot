@@ -31,7 +31,7 @@ class DeltaPublicStream:
 
     def subscription(self):
         names = ("ticker", "trades", "funding_rate", "ob_l2",
-                 "candlesticks_1m", "candlesticks_3m", "candlesticks_15m")
+                 "candlestick_1m", "candlestick_3m", "candlestick_15m")
         return {"type": "subscribe", "payload": {"channels": [
             {"name": name, "symbols": self.symbols} for name in names
         ]}}
@@ -70,7 +70,8 @@ class DeltaPublicStream:
         kind = data.get("type")
         if kind in ("subscriptions", "heartbeat", "pong"):
             return
-        symbol = data.get("sy") or data.get("symbol") or data.get("product_symbol")
+        product = data.get("product") if isinstance(data.get("product"), dict) else {}
+        symbol = data.get("sy") or data.get("symbol") or data.get("product_symbol") or product.get("symbol")
         if not symbol:
             return
         event = {"type": kind, "symbol": symbol, "received_at": time.time(), "raw": data}
@@ -88,14 +89,17 @@ class DeltaPublicStream:
                 self._seen.add(key)
                 if len(self._seen) > self.max_events * 2:
                     self._seen.clear()
-        elif kind and kind.startswith("candlesticks_"):
+        elif kind and kind.startswith("candlestick_"):
             try:
-                event.update(time=int(data.get("t") or data.get("time")),
+                raw_time = int(data.get("t") or data.get("time") or data.get("ts"))
+                event_time = raw_time / 1_000_000 if raw_time > 1e14 else raw_time
+                event.update(time=event_time,
                              open=float(data.get("o") or data.get("open")),
                              high=float(data.get("h") or data.get("high")),
                              low=float(data.get("l") or data.get("low")),
                              close=float(data.get("c") or data.get("close")),
-                             volume=float(data.get("v") or data.get("volume")))
+                             volume=float(data.get("v") or data.get("volume") or 0.0),
+                             resolution=data.get("res"))
             except (TypeError, ValueError):
                 return
         elif kind == "ticker":
@@ -113,6 +117,9 @@ class DeltaPublicStream:
                 return
         elif kind in ("ob_l2", "ob_updates"):
             event["book"] = data
+        elif kind == "product_updates":
+            event["product"] = product
+            event["market_event"] = data.get("event")
         self._publish(event)
 
     def _worker(self):
