@@ -76,8 +76,9 @@ class DeltaMarketData:
         frame["side"] = frame.side.astype(str).str.lower()
         frame = frame.dropna(subset=["time", "price", "volume"])
         frame = frame[(frame.price > 0) & (frame.volume > 0) & frame.side.isin(["buy", "sell"])]
-        return frame.sort_values("time").drop_duplicates(
-            ["time", "price", "volume", "side"]).reset_index(drop=True)
+        # Identical rows can represent distinct executions. The REST payload
+        # does not guarantee a stable trade ID, so preserve every returned print.
+        return frame.sort_values("time").reset_index(drop=True)
 
     def _fetch_candle_chunk(self, symbol, timeframe, start_ts, end_ts):
         payload = self._get_json("/v2/history/candles", {
