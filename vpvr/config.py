@@ -30,6 +30,7 @@ class VPVRConfig:
     slippage_bps: float = 2.0
     funding_rate_per_8h: float = 0.0
     profile_lookback_15m: int = 96
+    max_hold_minutes: int = 180
     paper_state_file: str = "data/vpvr_paper_state.json"
 
     @classmethod
@@ -56,6 +57,7 @@ class VPVRConfig:
             slippage_bps=float(os.getenv("VPVR_SLIPPAGE_BPS", "2")),
             funding_rate_per_8h=float(os.getenv("VPVR_FUNDING_RATE_PER_8H", "0")),
             profile_lookback_15m=int(os.getenv("VPVR_PROFILE_LOOKBACK_15M", "96")),
+            max_hold_minutes=int(os.getenv("VPVR_MAX_HOLD_MINUTES", "180")),
             paper_state_file=os.getenv("VPVR_PAPER_STATE_FILE", "data/vpvr_paper_state.json"),
         ).validate()
 
@@ -76,7 +78,7 @@ class VPVRConfig:
             raise ValueError("minimum reward/risk cannot be below 2")
         if self.node_smoothing_window < 1 or not 0 < self.node_threshold_pct < 1:
             raise ValueError("invalid volume-node configuration")
-        if self.max_data_age_seconds < 1 or self.profile_lookback_15m < 30:
+        if self.max_data_age_seconds < 1 or self.profile_lookback_15m < 30 or self.max_hold_minutes < 1:
             raise ValueError("invalid freshness/profile lookback")
         if self.max_spread_pct <= 0:
             raise ValueError("max spread must be positive")
