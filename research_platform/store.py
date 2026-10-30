@@ -18,7 +18,7 @@ from .market_data import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _json(value: object) -> str:
@@ -190,6 +190,20 @@ class ResearchDataStore:
             );
             CREATE INDEX IF NOT EXISTS paper_simulations_time_idx
                 ON paper_simulations(decision_time DESC);
+            CREATE TABLE IF NOT EXISTS variant_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                variant_id TEXT NOT NULL,
+                product_id TEXT NOT NULL REFERENCES instruments(product_id),
+                symbol TEXT NOT NULL,
+                decision_time TEXT NOT NULL,
+                evaluated_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                signal_json TEXT,
+                UNIQUE(variant_id,product_id,decision_time)
+            );
+            CREATE INDEX IF NOT EXISTS variant_evaluations_time_idx
+                ON variant_evaluations(evaluated_at DESC,id DESC);
         """)
         if version < SCHEMA_VERSION:
             self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -597,6 +611,73 @@ class ResearchDataStore:
             "offset": offset,
         }
 
+    def save_variant_evaluation(
+        self,
+        variant_id: str,
+        product_id: str,
+        symbol: str,
+        decision_time: datetime,
+        status: str,
+        reason: str,
+        signal: dict | None = None,
+        evaluated_at: datetime | None = None,
+    ) -> None:
+        if not all(value.strip() for value in (variant_id, product_id, symbol, status)):
+            raise ValueError("variant evaluation identity and status are required")
+        if status not in {
+            "signal", "no_signal", "insufficient_data", "unavailable", "error",
+        }:
+            raise ValueError(f"unsupported variant evaluation status: {status}")
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO variant_evaluations
+                (variant_id,product_id,symbol,decision_time,evaluated_at,status,reason,signal_json)
+                VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(variant_id,product_id,decision_time) DO UPDATE SET
+                evaluated_at=excluded.evaluated_at,status=excluded.status,
+                reason=excluded.reason,signal_json=excluded.signal_json
+            """, (
+                variant_id, str(product_id), symbol, _iso(decision_time),
+                _iso(evaluated_at or datetime.now(timezone.utc)), status, reason,
+                _json(signal) if signal is not None else None,
+            ))
+
+    def list_variant_evaluations(
+        self, limit: int = 100, offset: int = 0, symbol: str | None = None,
+        variant_id: str | None = None,
+    ) -> dict:
+        if limit < 1 or offset < 0:
+            raise ValueError("limit must be positive and offset non-negative")
+        conditions = []
+        params: list[object] = []
+        if symbol:
+            conditions.append("symbol=?")
+            params.append(symbol)
+        if variant_id:
+            conditions.append("variant_id=?")
+            params.append(variant_id)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        total = self.connection.execute(
+            f"SELECT COUNT(*) FROM variant_evaluations{where}", params
+        ).fetchone()[0]
+        rows = self.connection.execute(f"""
+            SELECT variant_id,product_id,symbol,decision_time,evaluated_at,
+                   status,reason,signal_json
+            FROM variant_evaluations{where}
+            ORDER BY evaluated_at DESC,id DESC LIMIT ? OFFSET ?
+        """, (*params, limit, offset)).fetchall()
+        return {
+            "items": [
+                dict(row) | {
+                    "signal": json.loads(row["signal_json"]) if row["signal_json"] else None
+                }
+                for row in rows
+            ],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
     def coverage_summary(self) -> dict:
         product_counts = {
             row["state"]: row["count"] for row in self.connection.execute("""
@@ -627,5 +708,8 @@ class ResearchDataStore:
             ).fetchone()[0],
             "paper_simulation_count": self.connection.execute(
                 "SELECT COUNT(*) FROM paper_simulations"
+            ).fetchone()[0],
+            "variant_evaluation_count": self.connection.execute(
+                "SELECT COUNT(*) FROM variant_evaluations"
             ).fetchone()[0],
         }

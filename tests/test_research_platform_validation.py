@@ -5,7 +5,14 @@ import unittest
 
 import pandas as pd
 
-from research_platform.validation import chronological_split, summarize_paper_results
+from research_platform.validation import (
+    bootstrap_expectancy_interval,
+    chronological_split,
+    deflated_sharpe_ratio,
+    purged_chronological_split,
+    summarize_paper_results,
+    walk_forward_splits,
+)
 
 
 UTC = timezone.utc
@@ -92,7 +99,47 @@ class ChronologicalValidationTests(unittest.TestCase):
         ])
         self.assertIsNone(summary["profit_factor"])
         self.assertTrue(summary["profit_factor_is_unbounded"])
+        self.assertIsNone(summary["expectancy_bootstrap_iid_95pct"])
         json.dumps(summary, allow_nan=False)
+
+    def test_purged_split_removes_rows_with_overlapping_label_windows(self):
+        split = purged_chronological_split(
+            self.frame,
+            train_end=datetime(2026, 1, 5, tzinfo=UTC),
+            validation_end=datetime(2026, 1, 8, tzinfo=UTC),
+            purge=timedelta(days=1),
+        )
+        self.assertEqual(list(split.train.value), [0, 1, 2])
+        self.assertEqual(list(split.validation.value), [4, 5])
+        self.assertEqual(list(split.out_of_sample.value), [7, 8, 9])
+
+    def test_walk_forward_splits_expand_training_window_and_keep_oos_later(self):
+        folds = walk_forward_splits(
+            self.frame,
+            train_window=timedelta(days=3),
+            validation_window=timedelta(days=2),
+            test_window=timedelta(days=2),
+            step=timedelta(days=2),
+        )
+        self.assertEqual(len(folds), 2)
+        self.assertLess(len(folds[0].train), len(folds[1].train))
+        for fold in folds:
+            self.assertLess(fold.train.time.max(), fold.validation.time.min())
+            self.assertLess(fold.validation.time.max(), fold.out_of_sample.time.min())
+
+    def test_bootstrap_and_deflated_sharpe_validate_inputs_and_are_deterministic(self):
+        values = [-1.0, 0.5, 1.0, 2.0, -0.5, 1.5]
+        first = bootstrap_expectancy_interval(values, seed=42)
+        self.assertEqual(first, bootstrap_expectancy_interval(values, seed=42))
+        self.assertLess(first[0], first[1])
+        with self.assertRaisesRegex(ValueError, "finite"):
+            bootstrap_expectancy_interval([1.0, float("nan")])
+        returns = [0.01, -0.002, 0.012, -0.001, 0.008, 0.003] * 10
+        single_trial = deflated_sharpe_ratio(returns, trial_count=1)
+        many_trials = deflated_sharpe_ratio(returns, trial_count=100)
+        self.assertGreaterEqual(single_trial, many_trials)
+        self.assertGreaterEqual(many_trials, 0)
+        self.assertLessEqual(single_trial, 1)
 
 
 if __name__ == "__main__":

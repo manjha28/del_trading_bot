@@ -28,12 +28,14 @@ research package is not connected to the live order loop.
   product metadata are retained. Candle timeframes and product-state coverage
   are declared per provider. Unsupported historical OI, liquidations, and
   order-book deltas remain unavailable.
-- **Canonical SQLite store v2:** stores product snapshots, candles, ticker
+- **Canonical SQLite store v3:** stores product snapshots, candles, ticker
   snapshots, trade prints, L2 snapshots, funding, and quality records in a
   separate database. It is not a migration of the coin-research store, VPVR
   state, or historical reports. Inactive product metadata is retained;
   “not returned” is assigned only for an explicitly complete catalog snapshot.
-  Version 2 adds an experiment registry and persisted paper-simulation outputs.
+  Version 2 added an experiment registry and persisted paper-simulation
+  outputs; version 3 adds per-variant evaluation records. The canonical store
+  remains separate from historical stores.
 - **Collector service:** reconciles the provider catalog and writes observations
   through the canonical store. It batch-fetches tickers and does not request
   live book/trade observations for non-live instruments. Unsupported fields
@@ -62,21 +64,40 @@ research package is not connected to the live order loop.
   summaries retain rejected candidates and explicitly make no significance or
   confidence-interval claim. Uncosted legacy exit outcomes are excluded from
   net-PnL aggregation.
-- **Verification:** 47 research-platform tests and 106 total repository tests
-  pass, covering collector, store, dashboard, entry/exit adapters, simulator,
-  and chronological validation. Compilation, CLI help, and `git diff --check`
-  also pass. Tests use fixtures and do not make exchange requests.
+- **Research variant suite:** registers ten independent strategy families with
+  explicit evidence requirements. Five candle-based variants have
+  research-only signal implementations (including a clearly labeled
+  candle-extreme sweep proxy); variants requiring historical absorption,
+  liquidation, funding/basis, complete trade tape, or synchronized book data
+  remain unavailable or capability-gated. No OHLCV history is described as
+  order-book absorption.
+- **Portfolio and walk-forward paper evaluation:** adds portfolio-level
+  open-slot, gross-notional, and stop-risk gates on top of the costed,
+  contract-verified single-trade simulator. The `backtest` CLI reads stored
+  candles, builds expanding chronological folds, hashes the dataset and
+  contract metadata, records each experiment and trade outcome, and keeps
+  discovered products with missing history in coverage. It also reports an
+  approximate Deflated-Sharpe diagnostic and IID bootstrap expectancy
+  interval; neither is dependence-robust or a substitute for independent
+  replication. The CLI does not load complete historical trades/books/funding,
+  so those candidates remain visibly insufficient or unavailable.
+- **Read-only subsystem summary:** the dashboard now reports available
+  coin-research summary/outcomes, VPVR paper-state summary, and MHR report-file
+  inventory alongside canonical platform data. This is a read-only summary,
+  not normalized ingestion or pooled cross-subsystem performance analysis.
+- **Verification:** 67 research-platform tests and 126 total repository tests
+  pass, including walk-forward candidate coverage and CLI outcome persistence.
+  Compilation, CLI help, and `git diff --check` also pass. Tests use fixtures
+  and do not make exchange requests.
 
-**Remaining before claiming integration:** exits are not uniformly executable
-through a shared contract: VPVR remains owned by its native paper engine, and
-the new research strategy variants have not been implemented. The simulator
-is single-trade and lacks depth/impact, partial fills, funding, margin and
-portfolio risk; walk-forward, purge/embargo methodology beyond chronological
-splits, confidence intervals, and selection-bias checks are absent. The
-dashboard reports stored data and results but does not yet aggregate the
-existing coin-research, VPVR, MHR, and legacy backtest stores. No production
-database migration or end-to-end feed recovery test has been performed. This
-remains an additive research foundation, not a fully integrated platform.
+**Remaining before claiming integration:** the platform is additive and
+research-only, not a fully integrated trading research stack. The shared
+simulator still lacks depth/impact, partial fills, latency, funding cash
+flows, margin/liquidation and correlation stress. Walk-forward reports are
+independent fold simulations, not a compounded multi-fold portfolio or
+selection-adjusted cross-strategy leaderboard. Historical OI, liquidations,
+order-book deltas and validated synchronized depth history remain unsupported.
+No live order path was changed or enabled.
 
 ## 1. Current dependency and data-flow map
 
@@ -135,9 +156,13 @@ flowchart LR
     Contracts[research_platform contracts]
     Adapters[coin_research / VPVR REST adapters]
     Collector[ResearchCollector]
-    Canonical[(ResearchDataStore v1)]
+    Canonical[(ResearchDataStore v3)]
     SignalAdapters[normalized strategy entry adapters]
+    Variants[capability-gated research variants]
+    PaperEval[portfolio paper and walk-forward evaluation]
     Delta --> Adapters --> Contracts --> Collector --> Canonical
+    Canonical --> Variants --> PaperEval
+    PaperEval --> Canonical
     MHR --> SignalAdapters
     Long --> SignalAdapters
     VPStrategies --> SignalAdapters
@@ -231,10 +256,10 @@ from discovery or research coverage.
 | 1. Registry and provider wrappers | Partial | Canonical product records and adapters over coin research / VPVR clients exist. They are not yet wired into existing scanner or CLI workflows. | All products reconciled; newly listed/inactive products retained; adapter parity for source-specific units and timestamps. |
 | 2. Aligned persistence | Initial slice implemented | Additive schema v2, collector CLI, and coverage queries persist supported observations; current store is separate from historical stores. No production migration or scheduler integration. | Idempotent writes, coverage/gap reporting, provenance, restart recovery, and existing store tests pass. |
 | 3. Strategy adapters | Entry wrappers implemented; exit normalization partial | Entry adapters wrap the six existing strategies. MHR, Scalp, and Fast/Slow exit simulators have normalized result wrappers; VPVR has a normalized plan but remains on its native paper engine. No common exit callback contract or live integration exists. | Parity fixtures show wrapper outputs match legacy behavior; no changes to MHR/live behavior; all signals contain timestamp and provenance; remaining VPVR behavior and stateful exits are explicitly covered. |
-| 4. Research variants | Not started | Implement each independent variant only when its required data capability is present. Keep unavailable variants explicitly disabled with reasons. | Per-variant unit tests, no-lookahead tests, and source-validity checks; absorption/order-flow variants require valid trade/book history. |
-| 5. Common simulator | Partial | A single-trade OHLCV paper simulator models verified product rules, fees, spread, slippage, stop gaps, and conservative intrabar ambiguity. It has no depth/impact, latency, partial fills, funding, margin, or portfolio netting. | Add deterministic fixtures for depth/impact, funding, and portfolio exposure. Simulator remains isolated from live client. |
-| 6. Validation / experiments | Partial | Schema-v2 experiment registry, chronological splits with embargo, and descriptive result summaries exist. Walk-forward, purge methodology, uncertainty, and selection-bias checks do not. | Reproducible OOS reports include every discovered product and distinguish no-data/no-event/no-trade from losses. |
-| 7. Unified read-only dashboard | Partial | Local read-only API/UI exposes the canonical registry, coverage, capabilities, experiment records, and paper simulation outputs. Existing subsystem stores and research-state diagnostics are not aggregated. | API/UI integration tests; read-only by construction; existing coin research dashboard remains usable. |
+| 4. Research variants | Partial; OHLCV variants implemented | Five OHLCV-based variants have research-only signals; trade-flow and book variants require evidence not loaded by the current backtest CLI. Absorption, liquidation, and basis/funding variants remain unavailable. | Per-variant unit tests, no-lookahead and source-validity tests; valid trade/book history is required before enabling those variants. |
+| 5. Common simulator | Partial; constrained portfolio paper simulation implemented | Verified contract rules, fees, spread, slippage, stop gaps, conservative intrabar ambiguity, portfolio slots, notional, and stop-risk gates are modeled. No depth/impact, latency, partial fills, funding, margin/liquidation, or correlation stress. | Add validated market-impact/fill/funding/margin models. Simulator remains isolated from live client. |
+| 6. Validation / experiments | Partial; walk-forward CLI implemented | Schema-v3 registry, expanding chronological folds, embargo/purge helpers, IID expectancy intervals, approximate DSR, and persisted per-trade outcomes exist. Fold equity is not compounded; statistical checks are approximations. | Add dependence-aware uncertainty, experiment selection controls, robustness testing, and independent replication. Include all discovered products in coverage. |
+| 7. Unified read-only dashboard | Partial; external status summaries added | Local read-only API/UI exposes canonical data, evaluations, experiments, simulations, and summaries from coin research, VPVR paper state, and MHR report inventory. It does not normalize or aggregate every subsystem's trade-level data. | Keep reads read-only; add cross-subsystem data normalization only with explicit provenance and coverage tests. |
 
 At every stage, shadow/paper output only. The first integration PR should not
 change the MHR implementation, `main.py`, existing live order behavior, or
@@ -244,17 +269,20 @@ historical reports. Review and test changes to those separately.
 
 ### Existing tests
 
-Ran the focused research-platform tests and the repository test suite:
+The latest focused and repository-wide runs used:
 
 ```text
-.venv/bin/python -m unittest discover -s tests -p 'test_research_platform*.py' -v
-Ran 41 tests
+.venv/bin/python -m unittest discover -s tests -p 'test_research_platform*.py'
+Ran 67 tests
+OK
+
+.venv/bin/python -m unittest discover -s tests
+Ran 126 tests
 OK
 ```
 
-The complete suite was also run successfully after this slice. These are
-fixture-based tests, not evidence of live Delta connectivity or complete
-end-to-end integration.
+Compilation, CLI help, and `git diff --check` also pass. Fixture tests are not
+evidence of live Delta connectivity or complete end-to-end integration.
 
 ### Not implemented or verified in this audit
 
@@ -263,8 +291,9 @@ end-to-end integration.
 - Sequence-gap detection and WebSocket resynchronization/replay.
 - Historical trade/book data completeness and valid absorption evidence.
 - Open-interest and liquidation history availability/quality.
-- Cross-strategy cost/fill/portfolio comparison and walk-forward results.
-- Shared frontend coverage of all subsystems.
+- Cross-strategy cost/fill comparison, compounded multi-fold portfolio
+  accounting, and statistical robustness beyond the implemented approximations.
+- Shared frontend coverage of all subsystems' normalized trade-level data.
 - Compatibility against live Delta product rules for every contract.
 
 ## 6. Explicit limitations and non-goals

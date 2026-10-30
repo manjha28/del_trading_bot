@@ -30,7 +30,15 @@ from .strategies import (
     VPVRStrategyAdapter,
 )
 from .simulation import PaperSimulationConfig, PaperSimulator, PaperTradeResult
-from .validation import ChronologicalPeriods, chronological_split, summarize_paper_results
+from .validation import (
+    ChronologicalPeriods,
+    bootstrap_expectancy_interval,
+    chronological_split,
+    deflated_sharpe_ratio,
+    purged_chronological_split,
+    summarize_paper_results,
+    walk_forward_splits,
+)
 from .exit_adapters import (
     ExitSimulationContext,
     FastSlowMAExitAdapter,
@@ -41,6 +49,8 @@ from .exit_adapters import (
     VPVRExitPlan,
     vpvr_exit_plan,
 )
+from .variants import ResearchVariant, ResearchVariantContext, ResearchVariantSuite
+from .portfolio import PortfolioPaperSimulator, PortfolioSimulationConfig, PortfolioSimulationResult
 
 __all__ = [
     "BookLevel",
@@ -59,12 +69,18 @@ __all__ = [
     "MarketDataProvider",
     "OrderBookSnapshot",
     "NormalizedExitOutcome",
+    "PortfolioPaperSimulator",
+    "PortfolioSimulationConfig",
+    "PortfolioSimulationResult",
     "PaperSimulationConfig",
     "PaperSimulator",
     "PaperTradeResult",
     "ProviderCapabilities",
     "ResearchCollector",
     "ResearchDataStore",
+    "ResearchVariant",
+    "ResearchVariantContext",
+    "ResearchVariantSuite",
     "ScalpPullbackAdapter",
     "ScalpPullbackExitAdapter",
     "StrategyAdapter",
@@ -80,6 +96,10 @@ __all__ = [
     "VPVRExitPlan",
     "VPVRStrategyAdapter",
     "chronological_split",
+    "bootstrap_expectancy_interval",
+    "deflated_sharpe_ratio",
+    "purged_chronological_split",
     "summarize_paper_results",
     "vpvr_exit_plan",
+    "walk_forward_splits",
 ]

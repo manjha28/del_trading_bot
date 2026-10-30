@@ -10,6 +10,7 @@ import sqlite3
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .market_data import TIMEFRAME_SECONDS
+from .variants import VARIANT_CATALOG
 from .store import ResearchDataStore
 
 
@@ -28,7 +29,86 @@ def _integer(params: dict[str, list[str]], name: str, default: int, maximum: int
     return min(value, maximum)
 
 
-def create_handler(db_path: str | Path):
+def _read_external_sources(source_paths: dict[str, str | Path]) -> dict:
+    sources = {}
+    coin_path = Path(source_paths["coin_research_db"])
+    if not coin_path.is_file():
+        sources["coin_research"] = {"status": "unavailable", "reason": "database not found"}
+    else:
+        try:
+            from coin_research.store import ResearchStore
+
+            with ResearchStore(coin_path, read_only=True) as store:
+                sources["coin_research"] = {
+                    "status": "available",
+                    "summary": store.summary(),
+                    "event_outcomes": store.list_outcomes(limit=20)["items"],
+                }
+        except (sqlite3.Error, OSError, ValueError):
+            logger.exception("Could not read coin-research store")
+            sources["coin_research"] = {
+                "status": "error",
+                "reason": "coin-research store could not be read",
+            }
+
+    paper_path = Path(source_paths["vpvr_paper_state"])
+    if not paper_path.is_file():
+        sources["vpvr_paper"] = {"status": "unavailable", "reason": "paper state not found"}
+    else:
+        try:
+            paper = json.loads(paper_path.read_text(encoding="utf-8"))
+            if paper.get("mode") != "PAPER_ONLY":
+                sources["vpvr_paper"] = {
+                    "status": "error",
+                    "reason": "paper state is not marked PAPER_ONLY",
+                }
+            else:
+                sources["vpvr_paper"] = {
+                    "status": "available",
+                    "mode": paper.get("mode"),
+                    "balance": paper.get("balance"),
+                    "position_count": len(paper.get("positions", {})),
+                    "pending_count": len(paper.get("pending", {})),
+                    "trade_count": len(paper.get("trades", [])),
+                    "recent_trades": paper.get("trades", [])[-20:],
+                }
+        except (OSError, json.JSONDecodeError, AttributeError):
+            logger.exception("Could not read VPVR paper state")
+            sources["vpvr_paper"] = {
+                "status": "error",
+                "reason": "VPVR paper state is invalid or unreadable",
+            }
+
+    reports = Path(source_paths["mhr_results_dir"])
+    if not reports.is_dir():
+        sources["mhr_reports"] = {"status": "unavailable", "reason": "report directory not found"}
+    else:
+        files = sorted(
+            (path for path in reports.glob("*.csv") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        sources["mhr_reports"] = {
+            "status": "available",
+            "report_count": len(files),
+            "latest_reports": [
+                {"name": path.name, "modified_at": path.stat().st_mtime, "bytes": path.stat().st_size}
+                for path in files[:20]
+            ],
+        }
+    return sources
+
+
+def create_handler(
+    db_path: str | Path,
+    source_paths: dict[str, str | Path] | None = None,
+):
+    source_paths = source_paths or {
+        "coin_research_db": "data/sleeping_coin_research.sqlite3",
+        "vpvr_paper_state": "data/vpvr_paper_state.json",
+        "mhr_results_dir": "strategy-short/mhr_pump_short/backtest_results",
+    }
+
     class PlatformRequestHandler(BaseHTTPRequestHandler):
         server_version = "UnifiedResearch/1.0"
 
@@ -101,9 +181,10 @@ def create_handler(db_path: str | Path):
                             "not_implemented": [
                                 "orderbook_deltas", "open_interest_history",
                                 "liquidation_history", "unified_cross_strategy_exit_engine",
-                                "live_strategy_exit_integration", "portfolio_simulator",
-                                "walk_forward_metrics", "selection_bias_adjustment",
-                                "confidence_intervals",
+                                "live_strategy_exit_integration",
+                                "cross_strategy_full_data_walk_forward_execution",
+                                "dependence_robust_confidence_intervals",
+                                "full_deflated_sharpe_analysis",
                             ],
                             "available_research_tools": [
                                 "single_trade_ohlcv_paper_simulator",
@@ -111,18 +192,43 @@ def create_handler(db_path: str | Path):
                                 "experiment_registry",
                                 "mhr_scalp_fast_slow_normalized_exit_adapters",
                                 "vpvr_normalized_exit_plan_delegating_to_paper_engine",
+                                "capability_gated_research_variant_suite",
+                                "portfolio_paper_simulator",
+                                "walk_forward_and_purged_splits",
+                                "iid_bootstrap_expectancy_interval",
+                                "approximate_deflated_sharpe_probability",
+                                "read_only_subsystem_summary_aggregation",
+                                "capability_gated_walk_forward_variant_evaluation",
+                                "paper_only_walk_forward_backtest_cli",
+                                "trade_outcome_persistence",
                             ],
                             "exit_adapter_limitations": [
                                 "legacy exit simulations do not apply fees or execution costs",
                                 "VPVR exits are still processed by its native paper engine",
                             ],
                             "paper_simulator_limitations": [
-                                "single trade at a time",
-                                "no partial fills, market impact, funding cash flows, or portfolio netting",
+                                "portfolio mode caps concurrent positions but uses independent OHLCV trade simulations",
+                                "no partial fills, market impact, funding cash flows, maintenance margin, liquidation, or correlation stress",
                                 "unverified contract specifications rejected",
                                 "OHLCV ambiguity resolved stop-first",
                             ],
                         }
+                    elif path == "/api/variants":
+                        result = {
+                            "items": [
+                                {
+                                    "strategy_id": item.strategy_id,
+                                    "title": item.title,
+                                    "status": item.status,
+                                    "required_data": item.required_data,
+                                    "minimum_history": item.minimum_history or {},
+                                    "limitations": item.limitations,
+                                }
+                                for item in VARIANT_CATALOG
+                            ],
+                        }
+                    elif path == "/api/sources":
+                        result = _read_external_sources(source_paths)
                     elif path == "/api/experiments":
                         result = store.list_experiments(
                             _integer(params, "limit", 100, MAX_LIMIT),
@@ -133,6 +239,13 @@ def create_handler(db_path: str | Path):
                             _integer(params, "limit", 100, MAX_LIMIT),
                             _integer(params, "offset", 0, 10_000_000),
                             params.get("symbol", [None])[0],
+                        )
+                    elif path == "/api/variant-evaluations":
+                        result = store.list_variant_evaluations(
+                            _integer(params, "limit", 100, MAX_LIMIT),
+                            _integer(params, "offset", 0, 10_000_000),
+                            params.get("symbol", [None])[0],
+                            params.get("variant_id", [None])[0],
                         )
                     else:
                         self._json(404, {"error": "not found"})
