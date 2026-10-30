@@ -88,7 +88,8 @@ def scan_once(symbols, paper=False, config=None):
     products={p["symbol"]:p for p in data.fetch_products()}
     tickers={t.get("symbol"):t for t in data.fetch_tickers() if t.get("symbol")}
     broker=PaperBroker(path=cfg.paper_state_file,initial_balance=cfg.initial_paper_balance,
-                       fee_rate=cfg.fee_rate,slippage_bps=cfg.slippage_bps,\n                       trailing_buffer_pct=cfg.stop_buffer_pct,max_hold_minutes=cfg.max_hold_minutes)
+                       fee_rate=cfg.fee_rate,slippage_bps=cfg.slippage_bps,
+                       trailing_buffer_pct=cfg.stop_buffer_pct,max_hold_minutes=cfg.max_hold_minutes)
     risk=RiskEngine(cfg)
     today=datetime.now(timezone.utc).date()
     _restore_risk(risk,broker,today)
