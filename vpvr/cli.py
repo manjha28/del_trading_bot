@@ -13,7 +13,7 @@ from pathlib import Path
 import pandas as pd
 from .config import VPVRConfig
 from .data import DeltaMarketData, MarketDataError
-from .indicators import cumulative_volume_delta
+from .indicators import cumulative_volume_delta, trade_delta_bars, delta_divergence
 from .profile import build_volume_profile, rolling_profiles
 from .regime import classify_regime
 from .strategies import generate_signals
@@ -115,7 +115,11 @@ def scan_once(symbols, paper=False, config=None):
             except (TypeError,ValueError): funding=None
             # Apply newly closed 1m bars once. On a fresh paper account only the newest
             # bar is processed to avoid inventing fills before the account was started.
+            trade_count_before=len(broker.state["trades"])
             paper_events=_process_new_paper_bars(broker,symbol,frames["1m"],funding) if paper else []
+            if paper:
+                for closed_trade in broker.state["trades"][trade_count_before:]:
+                    risk.record_close(float(closed_trade.get("net_pnl",0.0)))
             marks={symbol:float(ticker.get("mark_price") or frames["1m"].close.iloc[-1])}
             equity=broker.equity(marks)
             risk.update_equity(equity,today)
@@ -135,8 +139,20 @@ def scan_once(symbols, paper=False, config=None):
             try:
                 trades=data.fetch_public_trades(symbol)
                 cvd=cumulative_volume_delta(trades)
+                delta_bars=trade_delta_bars(trades,"1min")
+                divergence=delta_divergence(frames["1m"].tail(10),delta_bars.tail(10),lookback=10)
+                # Use trade-level VP only when the received tape covers the profile window.
+                profile_start=pd.Timestamp(profile_frame.time.iloc[0])
+                profile_end=pd.Timestamp(profile_frame.time.iloc[-1])+pd.Timedelta(minutes=15)
+                tape_covers_window=(not trades.empty and trades.time.min()<=profile_start and trades.time.max()>=profile_end-pd.Timedelta(minutes=1))
+                if tape_covers_window:
+                    profile=build_volume_profile(trades=trades.loc[(trades.time>=profile_start)&(trades.time<profile_end)],
+                        rows=cfg.profile_rows,value_area_pct=cfg.value_area_pct,
+                        smoothing_window=cfg.node_smoothing_window,node_threshold_pct=cfg.node_threshold_pct)
             except MarketDataError as exc:
                 cvd={"available":False,"value":None,"reason":str(exc)}
+                divergence={"available":False,"bullish":False,"bearish":False,"reason":str(exc)}
+                tape_covers_window=False
             specs=data.contract_specs(product)
             if specs is None:
                 output.append({"symbol":symbol,"status":"contract_metadata_incomplete",
@@ -170,6 +186,8 @@ def scan_once(symbols, paper=False, config=None):
                 "confidence":regime.confidence,"reasons":regime.reasons},
                 "profile":profile.as_dict(),"profile_source":profile.source,
                 "spread_pct":spread,"funding_rate":funding,"cvd":cvd,
+                "delta_divergence":divergence,"profile_source":profile.source,
+                "trade_tape_covers_profile_window":tape_covers_window,
                 "contract_specs":specs,"paper_events":paper_events,"signals":signal_rows})
         except (MarketDataError,ValueError,KeyError) as exc:
             output.append({"symbol":symbol,"status":"data_or_signal_error","reason":str(exc)})
@@ -238,7 +256,9 @@ def main(argv=None):
         started=time.time()
         try:
             while not args.duration_seconds or time.time()-started<args.duration_seconds:
-                print(json.dumps(stream.status()),flush=True);time.sleep(5)
+                status=stream.status()
+                status["buffered_events"]={symbol:len(stream.snapshot(symbol)) for symbol in args.symbols}
+                print(json.dumps(status),flush=True);time.sleep(5)
         except KeyboardInterrupt:
             pass
         finally:
