@@ -733,8 +733,6 @@ class ResearchDataStore:
             nested = config.get("portfolio", {})
             defaults = {
                 "trade_latency_seconds": 0.0,
-                "max_daily_realized_loss_pct": 0.02,
-                "max_realized_drawdown_pct": 0.10,
             }
             return {
                 key: config.get(key, nested.get(key, defaults.get(key)))
