@@ -9,10 +9,15 @@ local paper-state paths. It does not expose authenticated or live order APIs.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from vpvr.backtest import BacktestConfig, run_backtest
 from vpvr.cli import scan_once
@@ -287,11 +292,19 @@ with backtest_tab:
             manual_values["contract_multiplier"] = m1.number_input("Multiplier", min_value=0.00000001, value=default_multiplier, format="%.8f")
             manual_values["lot_size"] = m2.number_input("Lot increment (contracts)", min_value=1, value=1, step=1)
             manual_values["min_qty"] = m3.number_input("Minimum (contracts)", min_value=1, value=1, step=1)
-            manual_values["tick_size"] = m4.number_input("Tick size (manual)", min_value=0.00000001, value=0.5 if bt_symbol == "BTCUSD" else 0.05, format="%.8f")
+            manual_values["tick_size"] = m4.number_input("Tick size (manual)", min_value=0.0, value=0.0, format="%.8f")
             manual_values["position_size_limit"] = m5.number_input("Max order size (0 = none)", min_value=0, value=0, step=1)
             st.caption("Manual assumptions are shown in the result metadata and are never used by the live market scan or paper sizing gate.")
 
-    can_run = bool(csv_1m and csv_3m and csv_15m and (verified or use_manual))
+    manual_ready = (not use_manual) or (
+        manual_values.get("contract_multiplier", 0) > 0
+        and manual_values.get("lot_size", 0) > 0
+        and manual_values.get("min_qty", 0) > 0
+        and manual_values.get("tick_size", 0) > 0
+    )
+    can_run = bool(csv_1m and csv_3m and csv_15m and (verified or use_manual) and manual_ready)
+    if use_manual and not manual_ready:
+        st.caption("Enter a positive manual tick size before running this research-only backtest.")
     if st.button("Run backtest", type="primary", disabled=not can_run):
         try:
             frames = [
