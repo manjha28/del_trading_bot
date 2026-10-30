@@ -166,6 +166,7 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                 position=None
             else:
                 targets=pos["targets"]
+                target_index_before=pos["target_index"]
                 fractions=[1.0] if len(targets)==1 else ([.30,.45] if len(targets)==2 else [.30,.45,.25])
                 while pos["target_index"]<len(targets):
                     ix=pos["target_index"]
@@ -189,7 +190,22 @@ def run_backtest(symbol,candles_1m,candles_3m,candles_15m,config=None,contract_m
                         pos["stop"]=targets[0]
                     if pos["remaining"]<=1e-10:
                         break
-                if pos["remaining"]<=1e-10:
+                if pos["remaining"]>1e-10 and pos["target_index"]>target_index_before:
+                    tightened_stop_hit=bar["low"]<=pos["stop"] if direction=="LONG" else bar["high"]>=pos["stop"]
+                    if tightened_stop_hit:
+                        fill=pos["stop"]*(1-cfg.slippage_bps/10000 if direction=="LONG" else 1+cfg.slippage_bps/10000)
+                        qty=pos["remaining"]
+                        gross=((fill-pos["entry"]) if direction=="LONG" else (pos["entry"]-fill))*qty*contract_multiplier
+                        fee=abs(fill*qty*contract_multiplier)*cfg.fee_rate
+                        pos["gross_pnl"]+=gross
+                        pos["fees"]+=fee
+                        pos["net_pnl"]+=gross-fee
+                        equity+=gross-fee
+                        trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":fill,"exit_reason":"SAME_BAR_TIGHTENED_STOP",
+                            "holding_minutes":(ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60})
+                        consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
+                        position=None
+                if position is pos and pos["remaining"]<=1e-10:
                     trades.append({**pos,"exit_time":ts.isoformat(),"exit_price":targets[-1],"exit_reason":"TARGETS",
                         "holding_minutes":(ts-pd.Timestamp(pos["opened_at"])).total_seconds()/60})
                     consecutive_losses=consecutive_losses+1 if pos["net_pnl"]<0 else 0
